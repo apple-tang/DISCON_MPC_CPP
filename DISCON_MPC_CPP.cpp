@@ -79,7 +79,8 @@ namespace
     constexpr float VS_RtGnSp  = 121.6805f;
     constexpr float VS_RtPwr   = 5296610.0f;
     constexpr float OMEGA_REF = 0.0f;          // shutdown target rotor speed
-    constexpr float TG_REF = 0.0f;             // shutdown target generator torque [N-m]
+    constexpr float OMEGA_MIN = -0.2f;          // hard lower bound to avoid reverse rotation
+    constexpr float TG_REF = VS_MIN_TQ;        // shutdown target generator torque [N-m]
     constexpr float BETA_REF = PC_MAX_PIT;     // shutdown target collective pitch [rad]
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
@@ -331,6 +332,58 @@ namespace
              + a * b * g22;
     }
 
+    inline const char* qpReturnValueToString(returnValue rv)
+    {
+        switch (rv)
+        {
+        case SUCCESSFUL_RETURN:                  return "SUCCESSFUL_RETURN";
+        case RET_INVALID_ARGUMENTS:             return "RET_INVALID_ARGUMENTS";
+        case RET_INIT_FAILED:                   return "RET_INIT_FAILED";
+        case RET_INIT_FAILED_TQ:                return "RET_INIT_FAILED_TQ";
+        case RET_INIT_FAILED_CHOLESKY:          return "RET_INIT_FAILED_CHOLESKY";
+        case RET_INIT_FAILED_HOTSTART:          return "RET_INIT_FAILED_HOTSTART";
+        case RET_INIT_FAILED_INFEASIBILITY:     return "RET_INIT_FAILED_INFEASIBILITY";
+        case RET_INIT_FAILED_UNBOUNDEDNESS:     return "RET_INIT_FAILED_UNBOUNDEDNESS";
+        case RET_QP_UNBOUNDED:                  return "RET_QP_UNBOUNDED";
+        case RET_QP_INFEASIBLE:                 return "RET_QP_INFEASIBLE";
+        case RET_QP_NOT_SOLVED:                 return "RET_QP_NOT_SOLVED";
+        case RET_UNABLE_TO_SOLVE_QP:            return "RET_UNABLE_TO_SOLVE_QP";
+        case RET_HOTSTART_FAILED:               return "RET_HOTSTART_FAILED";
+        case RET_STEPDIRECTION_DETERMINATION_FAILED:
+                                                   return "RET_STEPDIRECTION_DETERMINATION_FAILED";
+        case RET_STEPLENGTH_DETERMINATION_FAILED:
+                                                   return "RET_STEPLENGTH_DETERMINATION_FAILED";
+        case RET_HOMOTOPY_STEP_FAILED:          return "RET_HOMOTOPY_STEP_FAILED";
+        case RET_HOTSTART_STOPPED_INFEASIBILITY:
+                                                   return "RET_HOTSTART_STOPPED_INFEASIBILITY";
+        case RET_HOTSTART_STOPPED_UNBOUNDEDNESS:
+                                                   return "RET_HOTSTART_STOPPED_UNBOUNDEDNESS";
+        case RET_MAX_NWSR_REACHED:              return "RET_MAX_NWSR_REACHED";
+        case RET_ADDCONSTRAINT_FAILED_INFEASIBILITY:
+                                                   return "RET_ADDCONSTRAINT_FAILED_INFEASIBILITY";
+        case RET_ADDBOUND_FAILED_INFEASIBILITY: return "RET_ADDBOUND_FAILED_INFEASIBILITY";
+        case RET_ENSURELI_FAILED:               return "RET_ENSURELI_FAILED";
+        case RET_HESSIAN_NOT_SPD:               return "RET_HESSIAN_NOT_SPD";
+        case RET_HESSIAN_INDEFINITE:            return "RET_HESSIAN_INDEFINITE";
+        case RET_MATRIX_FACTORISATION_FAILED:   return "RET_MATRIX_FACTORISATION_FAILED";
+        case RET_USING_REGULARISATION:          return "RET_USING_REGULARISATION";
+        default:                                return "RET_UNKNOWN_OR_UNMAPPED";
+        }
+    }
+
+    inline const char* qpSimpleStatusToString(returnValue rv)
+    {
+        switch (getSimpleStatus(rv, BT_FALSE))
+        {
+        case 0:  return "solved";
+        case 1:  return "iteration_limit";
+        case -1: return "internal_error";
+        case -2: return "infeasible";
+        case -3: return "unbounded";
+        default: return "unknown";
+        }
+    }
+
     inline void initializeBaselineStates(float time, float genSpeed, float bladePitch1)
     {
         gState.genSpeedF = genSpeed;
@@ -416,6 +469,7 @@ namespace
         float towerVelFA,
         float prevGenTorque,
         float prevPitchCmd,
+        std::string& solveErr,
         float& demandedGenTorque,
         float& demandedPitchCmd)
     {
@@ -640,6 +694,8 @@ namespace
         }
 
         // State constraints on predicted [dOmega, x_t, v_t]
+        // dOmega uses an asymmetric bound:
+        //   OMEGA_MIN <= rotSpeed = dOmega + OMEGA_REF <= gOmegaErrMax + OMEGA_REF
         const int stateRowBase = NC_INPUT;
         for (int p = 0; p < nPred; ++p)
         {
@@ -667,6 +723,7 @@ namespace
             ubA[upRow + 1] = static_cast<real_t>( gTowerDispMax - cDisp );
             ubA[upRow + 2] = static_cast<real_t>( gTowerVelMax  - cVel );
 
+            //ubA[lowRow + 0] = static_cast<real_t>( cOmega - OMEGA_MIN );
             ubA[lowRow + 0] = static_cast<real_t>( gOmegaErrMax + cOmega );
             ubA[lowRow + 1] = static_cast<real_t>( gTowerDispMax + cDisp );
             ubA[lowRow + 2] = static_cast<real_t>( gTowerVelMax  + cVel );
@@ -690,10 +747,33 @@ namespace
             nWSR
         );
         if (rv != SUCCESSFUL_RETURN)
+        {
+            std::ostringstream oss;
+            oss << "qpOASES init failed: "
+                << qpReturnValueToString(rv)
+                << " (code=" << static_cast<int>(rv)
+                << ", status=" << qpSimpleStatusToString(rv)
+                << ", nWSR_used=" << nWSR
+                << ", NU=" << NU
+                << ", NC=" << NC
+                << ")";
+            solveErr = oss.str();
             return false;
+        }
 
         std::vector<real_t> xOpt(NU, 0.0);
-        qp.getPrimalSolution(xOpt.data());
+        rv = qp.getPrimalSolution(xOpt.data());
+        if (rv != SUCCESSFUL_RETURN)
+        {
+            std::ostringstream oss;
+            oss << "qpOASES getPrimalSolution failed: "
+                << qpReturnValueToString(rv)
+                << " (code=" << static_cast<int>(rv)
+                << ", status=" << qpSimpleStatusToString(rv)
+                << ")";
+            solveErr = oss.str();
+            return false;
+        }
 
         const float dTg = static_cast<float>(xOpt[0]);
         const float dBeta = static_cast<float>(xOpt[1]);
@@ -792,6 +872,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
+        std::string qpErr;
         const bool qpSolved = solveMultiStepMPC(
             dt,
             rotSpeed,
@@ -800,6 +881,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             towerVelFA,
             gState.lastGenTorque,
             gState.pitchCmd,
+            qpErr,
             demandedGenTorque,
             demandedPitch
         );
@@ -807,7 +889,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         if (!qpSolved)
         {
             *aviFAIL = -1;
-            writeMessage(avcMSG, msgLen, "qpOASES multi-step MPC QP failed inside DISCON.");
+            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES multi-step MPC QP failed inside DISCON." : qpErr);
             return;
         }
     }
