@@ -79,6 +79,8 @@ namespace
     constexpr float VS_RtGnSp  = 121.6805f;
     constexpr float VS_RtPwr   = 5296610.0f;
     constexpr float OMEGA_REF = 0.0f;          // shutdown target rotor speed
+    constexpr float TG_REF = 0.0f;             // shutdown target generator torque [N-m]
+    constexpr float BETA_REF = PC_MAX_PIT;     // shutdown target collective pitch [rad]
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
     // Updated from the user's latest identified values.
@@ -99,6 +101,8 @@ namespace
     float gQOmega = 22.9f;
     float gQX     = 40.0f;
     float gQV     = 80.0f;
+    float gQTg    = 1.0e-6f;
+    float gQBeta  = 10.0f;
     float gRT     = 1.0e-9f;
     float gRB     = 120.0f;
     int   gNPred  = 5;
@@ -225,10 +229,13 @@ namespace
 
         // Backward-compatible parsing:
         // old format:  19 data lines, horizons fixed at 5/5 in code
-        // new format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
+        // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
+        // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
+        gQTg = 1.0e-6f;
+        gQBeta = 10.0f;
         if (lines.size() >= 21)
         {
             gNPred = std::stoi(lines[idx++]);
@@ -251,14 +258,30 @@ namespace
             return false;
         }
 
-        if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
-        if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
-        if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
-        if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
-        if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
-        if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
-        if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
-        if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
+        if (lines.size() >= 23)
+        {
+            if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQTg          = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQBeta        = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
+        }
+        else
+        {
+            if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
+        }
 
         gTable.loaded = true;
         return true;
@@ -411,12 +434,12 @@ namespace
         const float gFUNow     = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu,     horWindV, rotSpeedRPM) : G_FU_DEFAULT;
 
         // Augmented state:
-        // xbar = [ dOmega, x_t, v_t, u_prev_Tg, u_prev_beta ]^T
+        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref, beta - beta_ref ]^T
         const float x0 = rotSpeed - OMEGA_REF;
         const float x1 = towerDispFA;
         const float x2 = towerVelFA;
-        const float x3 = prevGenTorque;
-        const float x4 = prevPitchCmd;
+        const float x3 = prevGenTorque - TG_REF;
+        const float x4 = prevPitchCmd - BETA_REF;
 
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
 
@@ -542,7 +565,9 @@ namespace
             const int base = p * N_STATE;
             Qblk[(base + 0) * NX + (base + 0)] = gQOmega;
             Qblk[(base + 1) * NX + (base + 1)] = gQX;
-			Qblk[(base + 2) * NX + (base + 2)] = gQV;
+            Qblk[(base + 2) * NX + (base + 2)] = gQV;
+            Qblk[(base + 3) * NX + (base + 3)] = gQTg;
+            Qblk[(base + 4) * NX + (base + 4)] = gQBeta;
         }
         for (int p = 0; p < nCtrlH; ++p)
         {
