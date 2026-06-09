@@ -1,0 +1,10 @@
+build/
+*.obj
+*.lib
+*.exp
+*.dll
+*.user
+*.sln
+*.vcxproj*
+*.pdb
+.vs/
