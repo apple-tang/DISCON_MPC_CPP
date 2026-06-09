@@ -21,19 +21,23 @@ GFbeta.csv
 GFu.csv
 ! Line 11 : fracture switch time [s]
 30.0
-! Line 12 : Q_OMEGA
+! Line 12 : N_PRED
+5
+! Line 13 : N_CTRL_H
+5
+! Line 14 : Q_OMEGA
 22.9
-! Line 13 : Q_X
+! Line 15 : Q_X
 40.0
-! Line 14 : Q_V
+! Line 16 : Q_V
 80.0
-! Line 15 : R_T
+! Line 17 : R_T
 1.0e-9
-! Line 16 : R_B
+! Line 18 : R_B
 120.0
-! Line 17 : OMEGA_ERR_MAX [rad/s]
+! Line 19 : OMEGA_ERR_MAX [rad/s]
 2.0
-! Line 18 : TOWER_DISP_MAX [m]
+! Line 20 : TOWER_DISP_MAX [m]
 0.5
-! Line 19 : TOWER_VEL_MAX [m/s]
+! Line 21 : TOWER_VEL_MAX [m/s]
 0.5

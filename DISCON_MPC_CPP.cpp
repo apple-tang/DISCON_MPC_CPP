@@ -101,14 +101,14 @@ namespace
     float gQV     = 80.0f;
     float gRT     = 1.0e-9f;
     float gRB     = 120.0f;
+    int   gNPred  = 5;
+    int   gNCtrlH = 5;
     float gOmegaErrMax  = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
     float gTowerVelMax  = 0.5f;   // m/s
 
     constexpr int   N_STATE = 5;
     constexpr int   N_CTRL  = 2;
-    constexpr int   N_PRED  = 5;
-    constexpr int   N_CTRL_H = 5;
     constexpr float BIG_NEG = -1.0e20f;
 
     inline std::string cArrayToString(const char* data, int n)
@@ -222,14 +222,43 @@ namespace
         if (!loadCsvTable(makePath(lines[9]), nWind, nSpeed, gTable.GFu))     { err = "Failed loading GFu table.";     return false; }
 
         if (lines.size() >= 11) gFractureTime = std::stof(lines[10]);
-        if (lines.size() >= 12) gQOmega       = std::stof(lines[11]);
-        if (lines.size() >= 13) gQX           = std::stof(lines[12]);
-        if (lines.size() >= 14) gQV           = std::stof(lines[13]);
-        if (lines.size() >= 15) gRT           = std::stof(lines[14]);
-        if (lines.size() >= 16) gRB           = std::stof(lines[15]);
-        if (lines.size() >= 17) gOmegaErrMax  = std::stof(lines[16]);
-        if (lines.size() >= 18) gTowerDispMax = std::stof(lines[17]);
-        if (lines.size() >= 19) gTowerVelMax  = std::stof(lines[18]);
+
+        // Backward-compatible parsing:
+        // old format:  19 data lines, horizons fixed at 5/5 in code
+        // new format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
+        std::size_t idx = 11;
+        gNPred = 5;
+        gNCtrlH = 5;
+        if (lines.size() >= 21)
+        {
+            gNPred = std::stoi(lines[idx++]);
+            gNCtrlH = std::stoi(lines[idx++]);
+        }
+
+        if (gNPred < 1)
+        {
+            err = "N_PRED must be at least 1.";
+            return false;
+        }
+        if (gNCtrlH < 1)
+        {
+            err = "N_CTRL_H must be at least 1.";
+            return false;
+        }
+        if (gNCtrlH > gNPred)
+        {
+            err = "N_CTRL_H must be less than or equal to N_PRED.";
+            return false;
+        }
+
+        if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
+        if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
+        if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
+        if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
+        if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
+        if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
+        if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
+        if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
 
         gTable.loaded = true;
         return true;
@@ -367,6 +396,8 @@ namespace
         float& demandedGenTorque,
         float& demandedPitchCmd)
     {
+        const int nPred = gNPred;
+        const int nCtrlH = gNCtrlH;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
             [&](float a, float b){ return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
@@ -427,8 +458,8 @@ namespace
         Ebar[4] = 0.0f;
 
         // Build prediction matrices X = F*x0 + G*U
-        const int NX = N_STATE * N_PRED;
-        const int NU = N_CTRL * N_CTRL_H;
+        const int NX = N_STATE * nPred;
+        const int NU = N_CTRL * nCtrlH;
         std::vector<float> F(NX * N_STATE, 0.0f);
         std::vector<float> G(NX * NU, 0.0f);
 
@@ -455,8 +486,8 @@ namespace
         std::array<float, N_STATE * N_STATE> Apow{};
         for (int i = 0; i < N_STATE; ++i) Apow[i * N_STATE + i] = 1.0f;
 
-        std::array<std::array<float, N_STATE * N_STATE>, N_PRED> powers{};
-        for (int p = 0; p < N_PRED; ++p)
+        std::vector<std::array<float, N_STATE * N_STATE>> powers(static_cast<std::size_t>(nPred));
+        for (int p = 0; p < nPred; ++p)
         {
             Apow = matMulSq(Abar, Apow);
             powers[p] = Apow;
@@ -465,9 +496,9 @@ namespace
                     F[(p * N_STATE + i) * N_STATE + j] = Apow[i * N_STATE + j];
         }
 
-        for (int p = 0; p < N_PRED; ++p)
+        for (int p = 0; p < nPred; ++p)
         {
-            for (int c = 0; c <= p && c < N_CTRL_H; ++c)
+            for (int c = 0; c <= p && c < nCtrlH; ++c)
             {
                 std::array<float, N_STATE * N_CTRL> block{};
                 if (p == c)
@@ -489,7 +520,7 @@ namespace
         //     with constant preview disturbance dWind over the horizon.
         std::vector<float> c(NX, 0.0f);
         std::array<float, N_STATE> xpred = xbar0;
-        for (int p = 0; p < N_PRED; ++p)
+        for (int p = 0; p < nPred; ++p)
         {
             std::array<float, N_STATE> xnext{};
             for (int i = 0; i < N_STATE; ++i)
@@ -506,14 +537,14 @@ namespace
         std::vector<float> Qblk(NX * NX, 0.0f);
         std::vector<float> Rblk(NU * NU, 0.0f);
 
-        for (int p = 0; p < N_PRED; ++p)
+        for (int p = 0; p < nPred; ++p)
         {
             const int base = p * N_STATE;
             Qblk[(base + 0) * NX + (base + 0)] = gQOmega;
             Qblk[(base + 1) * NX + (base + 1)] = gQX;
 			Qblk[(base + 2) * NX + (base + 2)] = gQV;
         }
-        for (int p = 0; p < N_CTRL_H; ++p)
+        for (int p = 0; p < nCtrlH; ++p)
         {
             const int base = p * N_CTRL;
             Rblk[(base + 0) * NU + (base + 0)] = gRT;
@@ -553,7 +584,7 @@ namespace
         const float dBetaRate = PC_MAX_RAT * dt;
 
         std::vector<real_t> lb(NU, 0.0), ub(NU, 0.0);
-        for (int p = 0; p < N_CTRL_H; ++p)
+        for (int p = 0; p < nCtrlH; ++p)
         {
             lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRate);
             ub[p * N_CTRL + 0] = static_cast<real_t>( dTgRate);
@@ -563,33 +594,33 @@ namespace
 
         // Absolute-input constraints through cumulative-sum matrix Tu
         const int NC_INPUT = 2 * NU;
-        const int NC_STATE = 2 * 3 * N_PRED; // upper/lower bounds for [dOmega, x_t, v_t]
+        const int NC_STATE = 2 * 3 * nPred; // upper/lower bounds for [dOmega, x_t, v_t]
         const int NC = NC_INPUT + NC_STATE;
 
         std::vector<real_t> Acon(NC * NU, 0.0), lbA(NC, BIG_NEG), ubA(NC, 0.0);
-        for (int rowBlk = 0; rowBlk < N_CTRL_H; ++rowBlk)
+        for (int rowBlk = 0; rowBlk < nCtrlH; ++rowBlk)
         {
             for (int colBlk = 0; colBlk <= rowBlk; ++colBlk)
             {
                 Acon[(rowBlk * N_CTRL + 0) * NU + (colBlk * N_CTRL + 0)] = 1.0;
                 Acon[(rowBlk * N_CTRL + 1) * NU + (colBlk * N_CTRL + 1)] = 1.0;
-                Acon[((rowBlk + N_CTRL_H) * N_CTRL + 0) * NU + (colBlk * N_CTRL + 0)] = -1.0;
-                Acon[((rowBlk + N_CTRL_H) * N_CTRL + 1) * NU + (colBlk * N_CTRL + 1)] = -1.0;
+                Acon[((rowBlk + nCtrlH) * N_CTRL + 0) * NU + (colBlk * N_CTRL + 0)] = -1.0;
+                Acon[((rowBlk + nCtrlH) * N_CTRL + 1) * NU + (colBlk * N_CTRL + 1)] = -1.0;
             }
 
             ubA[rowBlk * N_CTRL + 0] = static_cast<real_t>(VS_MAX_TQ - prevGenTorque);
             ubA[rowBlk * N_CTRL + 1] = static_cast<real_t>(PC_MAX_PIT - prevPitchCmd);
-            ubA[(rowBlk + N_CTRL_H) * N_CTRL + 0] = static_cast<real_t>(prevGenTorque - VS_MIN_TQ);
-            ubA[(rowBlk + N_CTRL_H) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
+            ubA[(rowBlk + nCtrlH) * N_CTRL + 0] = static_cast<real_t>(prevGenTorque - VS_MIN_TQ);
+            ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
         }
 
         // State constraints on predicted [dOmega, x_t, v_t]
         const int stateRowBase = NC_INPUT;
-        for (int p = 0; p < N_PRED; ++p)
+        for (int p = 0; p < nPred; ++p)
         {
             const int xBase = p * N_STATE;
             const int upRow = stateRowBase + p * 3;
-            const int lowRow = stateRowBase + 3 * N_PRED + p * 3;
+            const int lowRow = stateRowBase + 3 * nPred + p * 3;
 
             // Upper-bound rows: G_state * U <= xmax - c_state
             for (int j = 0; j < NU; ++j)
@@ -699,7 +730,12 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 
         *aviFAIL = tablesLoaded ? 1 : -1;
         if (tablesLoaded)
-            writeMessage(avcMSG, msgLen, "Running C++ DISCON shell: baseline control before fracture, MPC after fracture.");
+        {
+            std::ostringstream oss;
+            oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
+                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ").";
+            writeMessage(avcMSG, msgLen, oss.str());
+        }
         else
             writeMessage(avcMSG, msgLen, loadErr);
     }
