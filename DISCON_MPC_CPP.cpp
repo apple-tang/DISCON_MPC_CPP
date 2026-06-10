@@ -23,6 +23,8 @@ namespace
     {
         bool initialized = false;
         bool fractureActive = false;
+        float fractureStartTime = 0.0f;
+        float fractureStartTorque = 0.0f;
         float lastTime = 0.0f;
         float lastGenTorque = 0.0f;
         float pitchCmd = 0.0f;
@@ -79,13 +81,20 @@ namespace
     constexpr float VS_RtGnSp  = 121.6805f;
     constexpr float VS_RtPwr   = 5296610.0f;
     constexpr float OMEGA_REF = 0.0f;          // shutdown target rotor speed
-    constexpr float OMEGA_MIN = -0.2f;          // hard lower bound to avoid reverse rotation
-    constexpr float TG_REF = VS_MIN_TQ;        // shutdown target generator torque [N-m]
+    constexpr float OMEGA_MIN = -0.2f;         // hard lower bound to avoid reverse rotation
+    constexpr float TG_REF_MIN = VS_MIN_TQ;    // low-speed shutdown target generator torque [N-m]
+    constexpr float TG_REF_MAX = VS_MAX_TQ;    // high-speed shutdown target generator torque [N-m]
+    constexpr float TG_REF_SWITCH_RPM = 3.0f;  // switch to low torque target below this rotor speed
+    constexpr float TG_REF_RAMP_RATE = VS_MAX_TQ_RATE; // ramp target torque after fracture [N-m/s]
     constexpr float BETA_REF = PC_MAX_PIT;     // shutdown target collective pitch [rad]
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
     // Updated from the user's latest identified values.
     constexpr float J_RF = 3.19609962e7f;      // kg m^2  (identified rotor-equivalent inertia at 70%)
+    constexpr float J_generatoe = 534.116f;    // Generator inertia about HSS (kg m^2)
+
+	constexpr float N_gear = 97.0f;            // gearbox ratio
+    constexpr float J_EQ = J_RF + J_generatoe * N_gear * N_gear; // 等效转动惯量（编译期计算）
     constexpr float M_T  = 3.822772e5f;        // kg
     constexpr float C_T  = 6.858330e3f;        // N s/m
     constexpr float K_T  = 1.184008e6f;        // N/m
@@ -384,6 +393,17 @@ namespace
         }
     }
 
+    inline float getGeneratorTorqueReference(float time, float rotSpeed)
+    {
+        const float rotSpeedRPM = rotSpeed * RPS2RPM;
+        if (rotSpeedRPM <= TG_REF_SWITCH_RPM)
+            return TG_REF_MIN;
+
+        const float fractureElapsed = std::max(time - gState.fractureStartTime, 0.0f);
+        const float rampedRef = gState.fractureStartTorque + TG_REF_RAMP_RATE * fractureElapsed;
+        return std::clamp(rampedRef, TG_REF_MIN, TG_REF_MAX);
+    }
+
     inline void initializeBaselineStates(float time, float genSpeed, float bladePitch1)
     {
         gState.genSpeedF = genSpeed;
@@ -462,6 +482,7 @@ namespace
     }
 
     inline bool solveMultiStepMPC(
+        float time,
         float dt,
         float rotSpeed,
         float horWindV,
@@ -476,6 +497,7 @@ namespace
         const int nPred = gNPred;
         const int nCtrlH = gNCtrlH;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
+        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
             [&](float a, float b){ return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
         const float dWind = horWindV - windRef;
@@ -488,11 +510,11 @@ namespace
         const float gFUNow     = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu,     horWindV, rotSpeedRPM) : G_FU_DEFAULT;
 
         // Augmented state:
-        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref, beta - beta_ref ]^T
+        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref(time, omega), beta - beta_ref ]^T
         const float x0 = rotSpeed - OMEGA_REF;
         const float x1 = towerDispFA;
         const float x2 = towerVelFA;
-        const float x3 = prevGenTorque - TG_REF;
+        const float x3 = prevGenTorque - tgRefNow;
         const float x4 = prevPitchCmd - BETA_REF;
 
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
@@ -504,16 +526,16 @@ namespace
         auto Aat = [&](int r, int c) -> float& { return Abar[r * N_STATE + c]; };
         auto Bat = [&](int r, int c) -> float& { return Bbar[r * N_CTRL + c]; };
 
-        const float a11 = 1.0f + dt * gTOmegaNow / J_RF;
+        const float a11 = 1.0f + dt * gTOmegaNow / J_EQ;
         const float a22 = 1.0f;
         const float a23 = dt;
         const float a31 = dt * gFOmegaNow / M_T;
         const float a32 = -dt * K_T / M_T;
         const float a33 = 1.0f - dt * C_T / M_T;
-        const float b11 = -dt / J_RF;
-        const float b12 =  dt * gTBetaNow / J_RF;
+        const float b11 = -dt * N_gear / J_EQ;
+        const float b12 =  dt * gTBetaNow / J_EQ;
         const float b32 =  dt * gFBetaNow / M_T;
-        const float e11 =  dt * gTUNow / J_RF;
+        const float e11 =  dt * gTUNow / J_EQ;
         const float e31 =  dt * gFUNow / M_T;
 
         Aat(0,0) = a11;  Aat(0,3) = b11;  Aat(0,4) = b12;
@@ -756,6 +778,7 @@ namespace
                 << ", nWSR_used=" << nWSR
                 << ", NU=" << NU
                 << ", NC=" << NC
+                << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
             return false;
@@ -770,6 +793,7 @@ namespace
                 << qpReturnValueToString(rv)
                 << " (code=" << static_cast<int>(rv)
                 << ", status=" << qpSimpleStatusToString(rv)
+                << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
             return false;
@@ -821,6 +845,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     {
         gState.initialized = true;
         gState.fractureActive = false;
+        gState.fractureStartTime = time;
+        gState.fractureStartTorque = 0.0f;
         gState.lastTime = time;
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
@@ -853,7 +879,11 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
 
     if (!gState.fractureActive && time >= gFractureTime)
+    {
         gState.fractureActive = true;
+        gState.fractureStartTime = time;
+        gState.fractureStartTorque = std::clamp(gState.lastGenTorque, VS_MIN_TQ, VS_MAX_TQ);
+    }
 
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
@@ -874,6 +904,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     {
         std::string qpErr;
         const bool qpSolved = solveMultiStepMPC(
+            time,
             dt,
             rotSpeed,
             horWindV,
@@ -921,7 +952,9 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
+        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         oss << "MPC shutdown active: Tg=" << demandedGenTorque
+            << " Nm, TgRef=" << tgRefNow
             << " Nm, beta=" << demandedPitch * R2D
             << " deg, dBeta=" << demandedPitchRate * R2D
             << " deg/s, wind=" << horWindV << " m/s";
