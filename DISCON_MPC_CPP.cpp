@@ -33,6 +33,7 @@ namespace
         float intSpdErr = 0.0f;
         float lastTimeVS = 0.0f;
         float lastTimePC = 0.0f;
+        float lastTimeMPC = 0.0f;
         float VS_Slope15 = 0.0f;
         float VS_Slope25 = 0.0f;
         float VS_SySp = 0.0f;
@@ -67,6 +68,7 @@ namespace
     constexpr float PC_KI      = 0.008068634f;
     constexpr float PC_KK      = 0.1099965f;
     constexpr float PC_REFSPD  = 122.9096f;
+    constexpr float MPC_DT     = 0.000125f;    // Match official 5MW controller communication interval
     constexpr float CORNER_FREQ = 1.570796f;
     constexpr float ONE_PLUS_EPS = 1.0f + 1.1920929e-07f;
     constexpr float VS_MAX_TQ  = 47402.91f;    // N-m
@@ -94,7 +96,8 @@ namespace
     constexpr float J_generatoe = 534.116f;    // Generator inertia about HSS (kg m^2)
 
 	constexpr float N_gear = 97.0f;            // gearbox ratio
-    constexpr float J_EQ = J_RF + J_generatoe * N_gear * N_gear; // 等效转动惯量（编译期计算）
+    constexpr float J_EQ = J_RF + J_generatoe * N_gear * N_gear;
+    constexpr float M_T  = 3.822772e5f;        // kg
     constexpr float M_T  = 3.822772e5f;        // kg
     constexpr float C_T  = 6.858330e3f;        // N s/m
     constexpr float K_T  = 1.184008e6f;        // N/m
@@ -413,6 +416,7 @@ namespace
         gState.lastTime = time;
         gState.lastTimePC = time - PC_DT;
         gState.lastTimeVS = time - VS_DT;
+        gState.lastTimeMPC = time - MPC_DT;
         gState.VS_SySp = VS_RtGnSp / (1.0f + 0.01f * VS_SlPc);
         gState.VS_Slope15 = (VS_Rgn2K * VS_Rgn2Sp * VS_Rgn2Sp) / (VS_Rgn2Sp - VS_CtInSp);
         gState.VS_Slope25 = (VS_RtPwr / VS_RtGnSp) / (VS_RtGnSp - gState.VS_SySp);
@@ -851,6 +855,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
         gState.lastPitchRate = 0.0f;
+        gState.lastTimeMPC = time - MPC_DT;
 
         std::string loadErr;
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
@@ -902,26 +907,35 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
-        std::string qpErr;
-        const bool qpSolved = solveMultiStepMPC(
-            time,
-            dt,
-            rotSpeed,
-            horWindV,
-            towerDispFA,
-            towerVelFA,
-            gState.lastGenTorque,
-            gState.pitchCmd,
-            qpErr,
-            demandedGenTorque,
-            demandedPitch
-        );
+        demandedGenTorque = gState.lastGenTorque;
+        demandedPitch = gState.pitchCmd;
 
-        if (!qpSolved)
+        if ((time * ONE_PLUS_EPS - gState.lastTimeMPC) >= MPC_DT)
         {
-            *aviFAIL = -1;
-            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES multi-step MPC QP failed inside DISCON." : qpErr);
-            return;
+            std::string qpErr;
+            const float mpcDt = std::max(time - gState.lastTimeMPC, 1.0e-6f);
+            const bool qpSolved = solveMultiStepMPC(
+                time,
+                mpcDt,
+                rotSpeed,
+                horWindV,
+                towerDispFA,
+                towerVelFA,
+                gState.lastGenTorque,
+                gState.pitchCmd,
+                qpErr,
+                demandedGenTorque,
+                demandedPitch
+            );
+
+            if (!qpSolved)
+            {
+                *aviFAIL = -1;
+                writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES multi-step MPC QP failed inside DISCON." : qpErr);
+                return;
+            }
+
+            gState.lastTimeMPC = time;
         }
     }
 
