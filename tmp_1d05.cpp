@@ -31,7 +31,6 @@ namespace
         float intSpdErr = 0.0f;
         float lastTimeVS = 0.0f;
         float lastTimePC = 0.0f;
-        float lastLidarLogTime = -1.0f;
         float VS_Slope15 = 0.0f;
         float VS_Slope25 = 0.0f;
         float VS_SySp = 0.0f;
@@ -51,24 +50,9 @@ namespace
         std::vector<std::vector<float>> GFu;
     };
 
-    struct LidarPreviewData
-    {
-        bool available = false;
-        int sensorType = 0;
-        int numBeams = 0;
-        int numPulseGates = 0;
-        float referenceWind = 0.0f;
-        std::vector<float> measuredSpeeds;
-        std::vector<float> posX;
-        std::vector<float> posY;
-        std::vector<float> posZ;
-    };
-
     ControllerState gState;
     GainTableData gTable;
-    LidarPreviewData gLidar;
     float gFractureTime = 30.0f;
-    std::string gDebugLogPath;
 
     constexpr float D2R = 0.017453292f;
     constexpr float R2D = 57.295780f;
@@ -76,67 +60,60 @@ namespace
     constexpr float PC_MAX_PIT = 1.570796f;
     constexpr float PC_MIN_PIT = 0.0f;
     constexpr float PC_MAX_RAT = 0.1396263f;   // rad/s
-    constexpr float PC_DT = 0.000125f;
-    constexpr float PC_KP = 0.01882681f;
-    constexpr float PC_KI = 0.008068634f;
-    constexpr float PC_KK = 0.1099965f;
-    constexpr float PC_REFSPD = 122.9096f;
+    constexpr float PC_DT      = 0.000125f;
+    constexpr float PC_KP      = 0.01882681f;
+    constexpr float PC_KI      = 0.008068634f;
+    constexpr float PC_KK      = 0.1099965f;
+    constexpr float PC_REFSPD  = 122.9096f;
     constexpr float CORNER_FREQ = 1.570796f;
     constexpr float ONE_PLUS_EPS = 1.0f + 1.1920929e-07f;
-    constexpr float VS_MAX_TQ = 47402.91f;    // N-m
-    constexpr float VS_MIN_TQ = 0.0f;
+    constexpr float VS_MAX_TQ  = 47402.91f;    // N-m
+    constexpr float VS_MIN_TQ  = 0.0f;
     constexpr float VS_MAX_TQ_RATE = 15000.0f; // N-m/s
-    constexpr float VS_DT = 0.000125f;
-    constexpr float VS_CtInSp = 70.16224f;
-    constexpr float VS_Rgn2Sp = 91.21091f;
-    constexpr float VS_Rgn2K = 2.332287f;
-    constexpr float VS_SlPc = 10.0f;
-    constexpr float VS_Rgn3MP = 0.01745329f;
-    constexpr float VS_RtGnSp = 121.6805f;
-    constexpr float VS_RtPwr = 5296610.0f;
+    constexpr float VS_DT      = 0.000125f;
+    constexpr float VS_CtInSp  = 70.16224f;
+    constexpr float VS_Rgn2Sp  = 91.21091f;
+    constexpr float VS_Rgn2K   = 2.332287f;
+    constexpr float VS_SlPc    = 10.0f;
+    constexpr float VS_Rgn3MP  = 0.01745329f;
+    constexpr float VS_RtGnSp  = 121.6805f;
+    constexpr float VS_RtPwr   = 5296610.0f;
     constexpr float OMEGA_REF = 0.0f;          // shutdown target rotor speed
-    constexpr float OMEGA_MIN = -0.2f;         // hard lower bound to avoid reverse rotation
+    constexpr float OMEGA_MIN = -0.2f;          // hard lower bound to avoid reverse rotation
     constexpr float TG_REF = VS_MIN_TQ;        // shutdown target generator torque [N-m]
     constexpr float BETA_REF = PC_MAX_PIT;     // shutdown target collective pitch [rad]
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
     // Updated from the user's latest identified values.
     constexpr float J_RF = 3.19609962e7f;      // kg m^2  (identified rotor-equivalent inertia at 70%)
-    constexpr float J_generator = 534.116f;    // Generator inertia about HSS (kg m^2)
-
-    constexpr float N_gear = 97.0f;            // gearbox ratio
-    constexpr float J_EQ = J_RF + J_generator * N_gear * N_gear; // 等效转动惯量
-    constexpr float M_T = 3.822772e5f;        // kg
-    constexpr float C_T = 6.858330e3f;        // N s/m
-    constexpr float K_T = 1.184008e6f;        // N/m
+    constexpr float M_T  = 3.822772e5f;        // kg
+    constexpr float C_T  = 6.858330e3f;        // N s/m
+    constexpr float K_T  = 1.184008e6f;        // N/m
     constexpr float OMEGA_T = 1.759900f;       // rad/s
-    constexpr float ZETA_T = 5.097086e-3f;    // -
+    constexpr float ZETA_T  = 5.097086e-3f;    // -
     constexpr float G_TOMEGA_DEFAULT = 0.0f;   // fallback until tables are loaded
     constexpr float G_FOMEGA_DEFAULT = 0.0f;
     constexpr float G_TBETA_DEFAULT = -2.0e6f;
     constexpr float G_FBETA_DEFAULT = 4.133385e4f;
     constexpr float G_TU_DEFAULT = 3.5e5f;
     constexpr float G_FU_DEFAULT = 2.0e4f;
-    constexpr int   LIDAR_MSR_START = 2000;  // C index for avrSWAP(2001)
-    constexpr int   LIDAR_MAX_CHAN  = 500;
-    constexpr float LIDAR_LOG_DT = 0.1f;     // seconds between lidar debug log entries
 
     // Tunable MPC weights and state-constraint limits.
     float gQOmega = 22.9f;
-    float gQX = 40.0f;
-    float gQV = 80.0f;
-    float gQTg = 1.0e-6f;
-    float gQBeta = 10.0f;
-    float gRT = 1.0e-9f;
-    float gRB = 120.0f;
-    int   gNPred = 5;
+    float gQX     = 40.0f;
+    float gQV     = 80.0f;
+    float gQTg    = 1.0e-6f;
+    float gQBeta  = 10.0f;
+    float gRT     = 1.0e-9f;
+    float gRB     = 120.0f;
+    int   gNPred  = 5;
     int   gNCtrlH = 5;
-    float gOmegaErrMax = 2.0f;   // rad/s
+    float gOmegaErrMax  = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
-    float gTowerVelMax = 0.5f;   // m/s
+    float gTowerVelMax  = 0.5f;   // m/s
 
     constexpr int   N_STATE = 5;
-    constexpr int   N_CTRL = 2;
+    constexpr int   N_CTRL  = 2;
     constexpr float BIG_NEG = -1.0e20f;
 
     inline std::string cArrayToString(const char* data, int n)
@@ -162,15 +139,6 @@ namespace
         if (b == std::string::npos) return {};
         const auto e = s.find_last_not_of(" \t\r\n");
         return s.substr(b, e - b + 1);
-    }
-
-    inline std::string replaceExtension(const std::string& path, const std::string& newExt)
-    {
-        const auto slashPos = path.find_last_of("\\/");
-        const auto dotPos = path.find_last_of('.');
-        if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos))
-            return path + newExt;
-        return path.substr(0, dotPos) + newExt;
     }
 
     inline std::string stripComment(const std::string& s)
@@ -252,11 +220,11 @@ namespace
         auto makePath = [&](const std::string& file) { return dir + "\\" + trim(file); };
 
         if (!loadCsvTable(makePath(lines[4]), nWind, nSpeed, gTable.GTomega)) { err = "Failed loading GTomega table."; return false; }
-        if (!loadCsvTable(makePath(lines[5]), nWind, nSpeed, gTable.GTbeta)) { err = "Failed loading GTbeta table.";  return false; }
-        if (!loadCsvTable(makePath(lines[6]), nWind, nSpeed, gTable.GTu)) { err = "Failed loading GTu table.";     return false; }
+        if (!loadCsvTable(makePath(lines[5]), nWind, nSpeed, gTable.GTbeta))  { err = "Failed loading GTbeta table.";  return false; }
+        if (!loadCsvTable(makePath(lines[6]), nWind, nSpeed, gTable.GTu))     { err = "Failed loading GTu table.";     return false; }
         if (!loadCsvTable(makePath(lines[7]), nWind, nSpeed, gTable.GFomega)) { err = "Failed loading GFomega table."; return false; }
-        if (!loadCsvTable(makePath(lines[8]), nWind, nSpeed, gTable.GFbeta)) { err = "Failed loading GFbeta table.";  return false; }
-        if (!loadCsvTable(makePath(lines[9]), nWind, nSpeed, gTable.GFu)) { err = "Failed loading GFu table.";     return false; }
+        if (!loadCsvTable(makePath(lines[8]), nWind, nSpeed, gTable.GFbeta))  { err = "Failed loading GFbeta table.";  return false; }
+        if (!loadCsvTable(makePath(lines[9]), nWind, nSpeed, gTable.GFu))     { err = "Failed loading GFu table.";     return false; }
 
         if (lines.size() >= 11) gFractureTime = std::stof(lines[10]);
 
@@ -293,27 +261,27 @@ namespace
 
         if (lines.size() >= 23)
         {
-            if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQX = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQV = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQTg = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQBeta = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRT = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRB = std::stof(lines[idx++]);
-            if (lines.size() > idx) gOmegaErrMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQTg          = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQBeta        = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
-            if (lines.size() > idx) gTowerVelMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
         }
         else
         {
-            if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQX = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQV = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRT = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRB = std::stof(lines[idx++]);
-            if (lines.size() > idx) gOmegaErrMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQOmega       = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQX           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gQV           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRT           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gRB           = std::stof(lines[idx++]);
+            if (lines.size() > idx) gOmegaErrMax  = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
-            if (lines.size() > idx) gTowerVelMax = std::stof(lines[idx++]);
+            if (lines.size() > idx) gTowerVelMax  = std::stof(lines[idx++]);
         }
 
         gTable.loaded = true;
@@ -323,76 +291,6 @@ namespace
     inline float clampToRange(float x, float lo, float hi)
     {
         return std::max(lo, std::min(x, hi));
-    }
-
-    inline void readLidarPreviewData(const float* avrSWAP, LidarPreviewData& lidar)
-    {
-        lidar = {};
-        if (avrSWAP == nullptr) return;
-
-        const int sensorType = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 0]));
-        const int numBeams = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 1]));
-        const int numPulseGates = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 2]));
-        const int nPts = numBeams * numPulseGates;
-        if (sensorType == 0 || nPts <= 0) return;
-
-        const int dataStart = LIDAR_MSR_START + 4;
-        const int maxPts = (LIDAR_MAX_CHAN - 4) / 4;
-        const int usedPts = std::min(nPts, maxPts);
-
-        lidar.available = true;
-        lidar.sensorType = sensorType;
-        lidar.numBeams = numBeams;
-        lidar.numPulseGates = numPulseGates;
-        lidar.referenceWind = avrSWAP[LIDAR_MSR_START + 3];
-        lidar.measuredSpeeds.resize(static_cast<std::size_t>(usedPts));
-        lidar.posX.resize(static_cast<std::size_t>(usedPts));
-        lidar.posY.resize(static_cast<std::size_t>(usedPts));
-        lidar.posZ.resize(static_cast<std::size_t>(usedPts));
-
-        for (int i = 0; i < usedPts; ++i)
-        {
-            lidar.measuredSpeeds[static_cast<std::size_t>(i)] = avrSWAP[dataStart + i];
-            lidar.posX[static_cast<std::size_t>(i)] = avrSWAP[dataStart + usedPts + i];
-            lidar.posY[static_cast<std::size_t>(i)] = avrSWAP[dataStart + 2 * usedPts + i];
-            lidar.posZ[static_cast<std::size_t>(i)] = avrSWAP[dataStart + 3 * usedPts + i];
-        }
-    }
-
-    inline std::vector<float> buildWindPreviewDeltas(
-        const LidarPreviewData& lidar,
-        float currentWind,
-        int nPred)
-    {
-        std::vector<float> dWindPreview(static_cast<std::size_t>(std::max(nPred, 0)), 0.0f);
-        if (!lidar.available || lidar.measuredSpeeds.empty()) return dWindPreview;
-
-        // Reference implementation path:
-        // use the arithmetic mean of all lidar measured speeds as a simple
-        // preview estimate and assume it stays constant over the horizon.
-        float sumWind = 0.0f;
-        for (float v : lidar.measuredSpeeds) sumWind += v;
-        const float previewMeanWind = sumWind / static_cast<float>(lidar.measuredSpeeds.size());
-        const float previewDelta = previewMeanWind - currentWind;
-        std::fill(dWindPreview.begin(), dWindPreview.end(), previewDelta);
-        return dWindPreview;
-    }
-
-    inline float getLidarMeanWind(const LidarPreviewData& lidar, float fallbackWind)
-    {
-        if (!lidar.available || lidar.measuredSpeeds.empty()) return fallbackWind;
-
-        float sumWind = 0.0f;
-        for (float v : lidar.measuredSpeeds) sumWind += v;
-        return sumWind / static_cast<float>(lidar.measuredSpeeds.size());
-    }
-
-    inline void appendDebugLog(const std::string& path, const std::string& line)
-    {
-        if (path.empty()) return;
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << line << '\n';
     }
 
     inline float interp2d(
@@ -423,15 +321,15 @@ namespace
         const float a = (iw2 == iw || std::fabs(w2 - w1) < 1e-8f) ? 0.0f : (windNow - w1) / (w2 - w1);
         const float b = (is2 == is || std::fabs(s2 - s1) < 1e-8f) ? 0.0f : (speedNow - s1) / (s2 - s1);
 
-        const float g11 = table[iw][is];
-        const float g21 = table[iw2][is];
-        const float g12 = table[iw][is2];
+        const float g11 = table[iw ][is ];
+        const float g21 = table[iw2][is ];
+        const float g12 = table[iw ][is2];
         const float g22 = table[iw2][is2];
 
         return (1.0f - a) * (1.0f - b) * g11
-            + a * (1.0f - b) * g21
-            + (1.0f - a) * b * g12
-            + a * b * g22;
+             + a * (1.0f - b) * g21
+             + (1.0f - a) * b * g12
+             + a * b * g22;
     }
 
     inline const char* qpReturnValueToString(returnValue rv)
@@ -452,17 +350,17 @@ namespace
         case RET_UNABLE_TO_SOLVE_QP:            return "RET_UNABLE_TO_SOLVE_QP";
         case RET_HOTSTART_FAILED:               return "RET_HOTSTART_FAILED";
         case RET_STEPDIRECTION_DETERMINATION_FAILED:
-            return "RET_STEPDIRECTION_DETERMINATION_FAILED";
+                                                   return "RET_STEPDIRECTION_DETERMINATION_FAILED";
         case RET_STEPLENGTH_DETERMINATION_FAILED:
-            return "RET_STEPLENGTH_DETERMINATION_FAILED";
+                                                   return "RET_STEPLENGTH_DETERMINATION_FAILED";
         case RET_HOMOTOPY_STEP_FAILED:          return "RET_HOMOTOPY_STEP_FAILED";
         case RET_HOTSTART_STOPPED_INFEASIBILITY:
-            return "RET_HOTSTART_STOPPED_INFEASIBILITY";
+                                                   return "RET_HOTSTART_STOPPED_INFEASIBILITY";
         case RET_HOTSTART_STOPPED_UNBOUNDEDNESS:
-            return "RET_HOTSTART_STOPPED_UNBOUNDEDNESS";
+                                                   return "RET_HOTSTART_STOPPED_UNBOUNDEDNESS";
         case RET_MAX_NWSR_REACHED:              return "RET_MAX_NWSR_REACHED";
         case RET_ADDCONSTRAINT_FAILED_INFEASIBILITY:
-            return "RET_ADDCONSTRAINT_FAILED_INFEASIBILITY";
+                                                   return "RET_ADDCONSTRAINT_FAILED_INFEASIBILITY";
         case RET_ADDBOUND_FAILED_INFEASIBILITY: return "RET_ADDBOUND_FAILED_INFEASIBILITY";
         case RET_ENSURELI_FAILED:               return "RET_ENSURELI_FAILED";
         case RET_HESSIAN_NOT_SPD:               return "RET_HESSIAN_NOT_SPD";
@@ -484,13 +382,6 @@ namespace
         case -3: return "unbounded";
         default: return "unknown";
         }
-    }
-
-    inline float getGeneratorTorqueReference(float time, float rotSpeed)
-    {
-        (void)time;
-        (void)rotSpeed;
-        return TG_REF;
     }
 
     inline void initializeBaselineStates(float time, float genSpeed, float bladePitch1)
@@ -571,13 +462,11 @@ namespace
     }
 
     inline bool solveMultiStepMPC(
-        float time,
         float dt,
         float rotSpeed,
         float horWindV,
         float towerDispFA,
         float towerVelFA,
-        const LidarPreviewData& lidar,
         float prevGenTorque,
         float prevPitchCmd,
         std::string& solveErr,
@@ -587,59 +476,57 @@ namespace
         const int nPred = gNPred;
         const int nCtrlH = gNCtrlH;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
-        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
-            [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
+            [&](float a, float b){ return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
         const float dWind = horWindV - windRef;
-        const std::vector<float> dWindPreview = buildWindPreviewDeltas(lidar, horWindV, nPred);
 
         const float gTOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTomega, horWindV, rotSpeedRPM) : G_TOMEGA_DEFAULT;
-        const float gTBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTbeta, horWindV, rotSpeedRPM) : G_TBETA_DEFAULT;
-        const float gTUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTu, horWindV, rotSpeedRPM) : G_TU_DEFAULT;
+        const float gTBetaNow  = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTbeta,  horWindV, rotSpeedRPM) : G_TBETA_DEFAULT;
+        const float gTUNow     = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTu,     horWindV, rotSpeedRPM) : G_TU_DEFAULT;
         const float gFOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFomega, horWindV, rotSpeedRPM) : G_FOMEGA_DEFAULT;
-        const float gFBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta, horWindV, rotSpeedRPM) : G_FBETA_DEFAULT;
-        const float gFUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu, horWindV, rotSpeedRPM) : G_FU_DEFAULT;
+        const float gFBetaNow  = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta,  horWindV, rotSpeedRPM) : G_FBETA_DEFAULT;
+        const float gFUNow     = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu,     horWindV, rotSpeedRPM) : G_FU_DEFAULT;
 
         // Augmented state:
-        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref(time, omega), beta - beta_ref ]^T
+        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref, beta - beta_ref ]^T
         const float x0 = rotSpeed - OMEGA_REF;
         const float x1 = towerDispFA;
         const float x2 = towerVelFA;
-        const float x3 = prevGenTorque - tgRefNow;
+        const float x3 = prevGenTorque - TG_REF;
         const float x4 = prevPitchCmd - BETA_REF;
 
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
 
         // One-step Euler-discretized augmented model
-        std::array<float, N_STATE* N_STATE> Abar{};
-        std::array<float, N_STATE* N_CTRL> Bbar{};
+        std::array<float, N_STATE * N_STATE> Abar{};
+        std::array<float, N_STATE * N_CTRL> Bbar{};
         std::array<float, N_STATE> Ebar{};
         auto Aat = [&](int r, int c) -> float& { return Abar[r * N_STATE + c]; };
         auto Bat = [&](int r, int c) -> float& { return Bbar[r * N_CTRL + c]; };
 
-        const float a11 = 1.0f + dt * gTOmegaNow / J_EQ;
+        const float a11 = 1.0f + dt * gTOmegaNow / J_RF;
         const float a22 = 1.0f;
         const float a23 = dt;
         const float a31 = dt * gFOmegaNow / M_T;
         const float a32 = -dt * K_T / M_T;
         const float a33 = 1.0f - dt * C_T / M_T;
-        const float b11 = -dt * N_gear / J_EQ;
-        const float b12 = dt * gTBetaNow / J_EQ;
-        const float b32 = dt * gFBetaNow / M_T;
-        const float e11 = dt * gTUNow / J_EQ;
-        const float e31 = dt * gFUNow / M_T;
+        const float b11 = -dt / J_RF;
+        const float b12 =  dt * gTBetaNow / J_RF;
+        const float b32 =  dt * gFBetaNow / M_T;
+        const float e11 =  dt * gTUNow / J_RF;
+        const float e31 =  dt * gFUNow / M_T;
 
-        Aat(0, 0) = a11;  Aat(0, 3) = b11;  Aat(0, 4) = b12;
-        Aat(1, 1) = a22;  Aat(1, 2) = a23;
-        Aat(2, 0) = a31;  Aat(2, 1) = a32;  Aat(2, 2) = a33;  Aat(2, 4) = b32;
-        Aat(3, 3) = 1.0f;
-        Aat(4, 4) = 1.0f;
+        Aat(0,0) = a11;  Aat(0,3) = b11;  Aat(0,4) = b12;
+        Aat(1,1) = a22;  Aat(1,2) = a23;
+        Aat(2,0) = a31;  Aat(2,1) = a32;  Aat(2,2) = a33;  Aat(2,4) = b32;
+        Aat(3,3) = 1.0f;
+        Aat(4,4) = 1.0f;
 
-        Bat(0, 0) = b11;  Bat(0, 1) = b12;
-        Bat(1, 0) = 0.0f; Bat(1, 1) = 0.0f;
-        Bat(2, 0) = 0.0f; Bat(2, 1) = b32;
-        Bat(3, 0) = 1.0f; Bat(3, 1) = 0.0f;
-        Bat(4, 0) = 0.0f; Bat(4, 1) = 1.0f;
+        Bat(0,0) = b11;  Bat(0,1) = b12;
+        Bat(1,0) = 0.0f; Bat(1,1) = 0.0f;
+        Bat(2,0) = 0.0f; Bat(2,1) = b32;
+        Bat(3,0) = 1.0f; Bat(3,1) = 0.0f;
+        Bat(4,0) = 0.0f; Bat(4,1) = 1.0f;
 
         Ebar[0] = e11;
         Ebar[1] = 0.0f;
@@ -653,30 +540,30 @@ namespace
         std::vector<float> F(NX * N_STATE, 0.0f);
         std::vector<float> G(NX * NU, 0.0f);
 
-        auto matMulSq = [&](const std::array<float, N_STATE* N_STATE>& M,
-            const std::array<float, N_STATE* N_STATE>& N) {
-                std::array<float, N_STATE* N_STATE> R{};
-                for (int i = 0; i < N_STATE; ++i)
-                    for (int j = 0; j < N_STATE; ++j)
-                        for (int k = 0; k < N_STATE; ++k)
-                            R[i * N_STATE + j] += M[i * N_STATE + k] * N[k * N_STATE + j];
-                return R;
-            };
+        auto matMulSq = [&](const std::array<float, N_STATE * N_STATE>& M,
+                            const std::array<float, N_STATE * N_STATE>& N) {
+            std::array<float, N_STATE * N_STATE> R{};
+            for (int i = 0; i < N_STATE; ++i)
+                for (int j = 0; j < N_STATE; ++j)
+                    for (int k = 0; k < N_STATE; ++k)
+                        R[i * N_STATE + j] += M[i * N_STATE + k] * N[k * N_STATE + j];
+            return R;
+        };
 
-        auto matMulAB = [&](const std::array<float, N_STATE* N_STATE>& M,
-            const std::array<float, N_STATE* N_CTRL>& N) {
-                std::array<float, N_STATE* N_CTRL> R{};
-                for (int i = 0; i < N_STATE; ++i)
-                    for (int j = 0; j < N_CTRL; ++j)
-                        for (int k = 0; k < N_STATE; ++k)
-                            R[i * N_CTRL + j] += M[i * N_STATE + k] * N[k * N_CTRL + j];
-                return R;
-            };
+        auto matMulAB = [&](const std::array<float, N_STATE * N_STATE>& M,
+                            const std::array<float, N_STATE * N_CTRL>& N) {
+            std::array<float, N_STATE * N_CTRL> R{};
+            for (int i = 0; i < N_STATE; ++i)
+                for (int j = 0; j < N_CTRL; ++j)
+                    for (int k = 0; k < N_STATE; ++k)
+                        R[i * N_CTRL + j] += M[i * N_STATE + k] * N[k * N_CTRL + j];
+            return R;
+        };
 
-        std::array<float, N_STATE* N_STATE> Apow{};
+        std::array<float, N_STATE * N_STATE> Apow{};
         for (int i = 0; i < N_STATE; ++i) Apow[i * N_STATE + i] = 1.0f;
 
-        std::vector<std::array<float, N_STATE* N_STATE>> powers(static_cast<std::size_t>(nPred));
+        std::vector<std::array<float, N_STATE * N_STATE>> powers(static_cast<std::size_t>(nPred));
         for (int p = 0; p < nPred; ++p)
         {
             Apow = matMulSq(Abar, Apow);
@@ -690,7 +577,7 @@ namespace
         {
             for (int c = 0; c <= p && c < nCtrlH; ++c)
             {
-                std::array<float, N_STATE* N_CTRL> block{};
+                std::array<float, N_STATE * N_CTRL> block{};
                 if (p == c)
                 {
                     block = Bbar;
@@ -706,21 +593,18 @@ namespace
             }
         }
 
-        // c = predicted state stack under zero control increments.
-        // If lidar preview is available, each prediction step uses the
-        // corresponding preview disturbance dWindPreview[p]. Otherwise, fall
-        // back to the legacy constant-over-horizon disturbance dWind.
+        // c = predicted state stack under zero control increments but
+        //     with constant preview disturbance dWind over the horizon.
         std::vector<float> c(NX, 0.0f);
         std::array<float, N_STATE> xpred = xbar0;
         for (int p = 0; p < nPred; ++p)
         {
-            const float dWindStep = gLidar.available ? dWindPreview[static_cast<std::size_t>(p)] : dWind;
             std::array<float, N_STATE> xnext{};
             for (int i = 0; i < N_STATE; ++i)
             {
                 for (int j = 0; j < N_STATE; ++j)
                     xnext[i] += Abar[i * N_STATE + j] * xpred[j];
-                xnext[i] += Ebar[i] * dWindStep;
+                xnext[i] += Ebar[i] * dWind;
                 c[p * N_STATE + i] = xnext[i];
             }
             xpred = xnext;
@@ -782,9 +666,9 @@ namespace
         for (int p = 0; p < nCtrlH; ++p)
         {
             lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRate);
-            ub[p * N_CTRL + 0] = static_cast<real_t>(dTgRate);
+            ub[p * N_CTRL + 0] = static_cast<real_t>( dTgRate);
             lb[p * N_CTRL + 1] = static_cast<real_t>(-dBetaRate);
-            ub[p * N_CTRL + 1] = static_cast<real_t>(dBetaRate);
+            ub[p * N_CTRL + 1] = static_cast<real_t>( dBetaRate);
         }
 
         // Absolute-input constraints through cumulative-sum matrix Tu
@@ -832,17 +716,17 @@ namespace
             }
 
             const float cOmega = c[xBase + 0];
-            const float cDisp = c[xBase + 1];
-            const float cVel = c[xBase + 2];
+            const float cDisp  = c[xBase + 1];
+            const float cVel   = c[xBase + 2];
 
-            ubA[upRow + 0] = static_cast<real_t>(gOmegaErrMax - cOmega);
-            ubA[upRow + 1] = static_cast<real_t>(gTowerDispMax - cDisp);
-            ubA[upRow + 2] = static_cast<real_t>(gTowerVelMax - cVel);
+            ubA[upRow + 0] = static_cast<real_t>( gOmegaErrMax - cOmega );
+            ubA[upRow + 1] = static_cast<real_t>( gTowerDispMax - cDisp );
+            ubA[upRow + 2] = static_cast<real_t>( gTowerVelMax  - cVel );
 
             //ubA[lowRow + 0] = static_cast<real_t>( cOmega - OMEGA_MIN );
-            ubA[lowRow + 0] = static_cast<real_t>(gOmegaErrMax + cOmega);
-            ubA[lowRow + 1] = static_cast<real_t>(gTowerDispMax + cDisp);
-            ubA[lowRow + 2] = static_cast<real_t>(gTowerVelMax + cVel);
+            ubA[lowRow + 0] = static_cast<real_t>( gOmegaErrMax + cOmega );
+            ubA[lowRow + 1] = static_cast<real_t>( gTowerDispMax + cDisp );
+            ubA[lowRow + 2] = static_cast<real_t>( gTowerVelMax  + cVel );
         }
 
         // create and solve QP
@@ -872,7 +756,6 @@ namespace
                 << ", nWSR_used=" << nWSR
                 << ", NU=" << NU
                 << ", NC=" << NC
-                << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
             return false;
@@ -887,7 +770,6 @@ namespace
                 << qpReturnValueToString(rv)
                 << " (code=" << static_cast<int>(rv)
                 << ", status=" << qpSimpleStatusToString(rv)
-                << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
             return false;
@@ -897,7 +779,7 @@ namespace
         const float dBeta = static_cast<float>(xOpt[1]);
 
         demandedGenTorque = std::clamp(prevGenTorque + dTg, VS_MIN_TQ, VS_MAX_TQ);
-        demandedPitchCmd = std::clamp(prevPitchCmd + dBeta, PC_MIN_PIT, PC_MAX_PIT);
+        demandedPitchCmd  = std::clamp(prevPitchCmd + dBeta, PC_MIN_PIT, PC_MAX_PIT);
         return true;
     }
 }
@@ -925,7 +807,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     const float towerVelFA = avrSWAP[1018];                         // avrSWAP(1019)
     const float towerVelSS = avrSWAP[1019];                         // avrSWAP(1020)
     const float towerDispFA = avrSWAP[1020];                        // avrSWAP(1021)
-    readLidarPreviewData(avrSWAP, gLidar);
 
     (void)genSpeed;
     (void)rotSpeed;
@@ -944,12 +825,9 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
         gState.lastPitchRate = 0.0f;
-        gState.lastLidarLogTime = -1.0f;
 
         std::string loadErr;
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
-        const std::string outRoot = cArrayToString(avcOUTNAME, outNameLen);
-        gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
 
         if (tablesLoaded)
@@ -975,9 +853,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
 
     if (!gState.fractureActive && time >= gFractureTime)
-    {
         gState.fractureActive = true;
-    }
 
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
@@ -998,13 +874,11 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     {
         std::string qpErr;
         const bool qpSolved = solveMultiStepMPC(
-            time,
             dt,
             rotSpeed,
             horWindV,
             towerDispFA,
             towerVelFA,
-            gLidar,
             gState.lastGenTorque,
             gState.pitchCmd,
             qpErr,
@@ -1047,33 +921,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
-        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
-        const float lidarMeanWind = getLidarMeanWind(gLidar, horWindV);
-        const float lidarPreviewDelta = lidarMeanWind - horWindV;
         oss << "MPC shutdown active: Tg=" << demandedGenTorque
-            << " Nm, TgRef=" << tgRefNow
             << " Nm, beta=" << demandedPitch * R2D
             << " deg, dBeta=" << demandedPitchRate * R2D
-            << " deg/s, wind=" << horWindV << " m/s"
-            << ", lidarAvail=" << (gLidar.available ? 1 : 0)
-            << ", lidarPts=" << gLidar.measuredSpeeds.size()
-            << ", lidarMean=" << lidarMeanWind
-            << " m/s, lidarDelta=" << lidarPreviewDelta << " m/s";
-
-        if (gState.lastLidarLogTime < 0.0f || (time - gState.lastLidarLogTime) >= LIDAR_LOG_DT)
-        {
-            std::ostringstream dbg;
-            dbg << "time=" << time
-                << ", wind=" << horWindV
-                << ", lidarAvail=" << (gLidar.available ? 1 : 0)
-                << ", lidarPts=" << gLidar.measuredSpeeds.size()
-                << ", lidarMean=" << lidarMeanWind
-                << ", lidarDelta=" << lidarPreviewDelta
-                << ", Tg=" << demandedGenTorque
-                << ", betaDeg=" << demandedPitch * R2D;
-            appendDebugLog(gDebugLogPath, dbg.str());
-            gState.lastLidarLogTime = time;
-        }
+            << " deg/s, wind=" << horWindV << " m/s";
     }
     writeMessage(avcMSG, msgLen, oss.str());
 }
