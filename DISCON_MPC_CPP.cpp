@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <qpOASES.hpp>
+#include "terminal_mpc_schedule.hpp"
 
 #ifdef _WIN32
 #define DLL_EXPORT extern "C" __declspec(dllexport)
@@ -139,6 +140,11 @@ namespace
     constexpr int   N_CTRL = 2;
     constexpr float BIG_NEG = -1.0e20f;
 
+    using MatNN = std::array<float, N_STATE * N_STATE>;
+    using MatNU = std::array<float, N_STATE * N_CTRL>;
+    using MatUN = std::array<float, N_CTRL * N_STATE>;
+    using MatUU = std::array<float, N_CTRL * N_CTRL>;
+
     inline std::string cArrayToString(const char* data, int n)
     {
         if (data == nullptr || n <= 0) return {};
@@ -171,6 +177,84 @@ namespace
         if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos))
             return path + newExt;
         return path.substr(0, dotPos) + newExt;
+    }
+
+    inline bool invert2x2(const MatUU& M, MatUU& Minv)
+    {
+        const float a = M[0];
+        const float b = M[1];
+        const float c = M[2];
+        const float d = M[3];
+        const float det = a * d - b * c;
+        if (std::fabs(det) < 1.0e-12f) return false;
+
+        const float invDet = 1.0f / det;
+        Minv = { d * invDet, -b * invDet,
+                -c * invDet,  a * invDet };
+        return true;
+    }
+
+    inline MatNN makeDiagonalQ()
+    {
+        MatNN Q{};
+        Q[0 * N_STATE + 0] = gQOmega;
+        Q[1 * N_STATE + 1] = gQX;
+        Q[2 * N_STATE + 2] = gQV;
+        Q[3 * N_STATE + 3] = gQTg;
+        Q[4 * N_STATE + 4] = gQBeta;
+        return Q;
+    }
+
+    inline MatUU makeDiagonalR()
+    {
+        MatUU R{};
+        R[0 * N_CTRL + 0] = gRT;
+        R[1 * N_CTRL + 1] = gRB;
+        return R;
+    }
+
+    inline int lookupTerminalScheduleIndex(float windNow, float speedNowRpm)
+    {
+        auto nearestIndex = [](const auto& arr, float x) -> int
+        {
+            int idx = 0;
+            float best = std::fabs(arr[0] - x);
+            for (int i = 1; i < static_cast<int>(arr.size()); ++i)
+            {
+                const float err = std::fabs(arr[i] - x);
+                if (err < best)
+                {
+                    best = err;
+                    idx = i;
+                }
+            }
+            return idx;
+        };
+
+        const int iw = nearestIndex(kTerminalWindPoints, windNow);
+        const int is = nearestIndex(kTerminalSpeedPoints, speedNowRpm);
+        const int tableIdx = iw * kTerminalNumSpeed + is;
+        return kTerminalPointToIndex[tableIdx];
+    }
+
+    inline MatNN getScheduledTerminalP(float windNow, float speedNowRpm)
+    {
+        MatNN P{};
+        const int idx = lookupTerminalScheduleIndex(windNow, speedNowRpm);
+        const int offset = idx * (N_STATE * N_STATE);
+        for (int i = 0; i < N_STATE * N_STATE; ++i)
+            P[i] = kTerminalPTable[static_cast<std::size_t>(offset + i)];
+        return P;
+    }
+
+    inline MatUN getScheduledTerminalK(float windNow, float speedNowRpm)
+    {
+        MatUN K{};
+        const int idx = lookupTerminalScheduleIndex(windNow, speedNowRpm);
+        const int offset = idx * (N_CTRL * N_STATE);
+        for (int i = 0; i < N_CTRL * N_STATE; ++i)
+            K[i] = kTerminalKTable[static_cast<std::size_t>(offset + i)];
+        return K;
     }
 
     inline std::string stripComment(const std::string& s)
@@ -611,8 +695,8 @@ namespace
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
 
         // One-step Euler-discretized augmented model
-        std::array<float, N_STATE* N_STATE> Abar{};
-        std::array<float, N_STATE* N_CTRL> Bbar{};
+        MatNN Abar{};
+        MatNU Bbar{};
         std::array<float, N_STATE> Ebar{};
         auto Aat = [&](int r, int c) -> float& { return Abar[r * N_STATE + c]; };
         auto Bat = [&](int r, int c) -> float& { return Bbar[r * N_CTRL + c]; };
@@ -646,6 +730,10 @@ namespace
         Ebar[2] = e31;
         Ebar[3] = 0.0f;
         Ebar[4] = 0.0f;
+
+        const MatNN terminalP = getScheduledTerminalP(horWindV, rotSpeedRPM);
+        const MatUN terminalK = getScheduledTerminalK(horWindV, rotSpeedRPM);
+        (void)terminalK;
 
         // Build prediction matrices X = F*x0 + G*U
         const int NX = N_STATE * nPred;
@@ -730,14 +818,14 @@ namespace
         std::vector<float> Qblk(NX * NX, 0.0f);
         std::vector<float> Rblk(NU * NU, 0.0f);
 
+        const MatNN stageQ = makeDiagonalQ();
         for (int p = 0; p < nPred; ++p)
         {
             const int base = p * N_STATE;
-            Qblk[(base + 0) * NX + (base + 0)] = gQOmega;
-            Qblk[(base + 1) * NX + (base + 1)] = gQX;
-            Qblk[(base + 2) * NX + (base + 2)] = gQV;
-            Qblk[(base + 3) * NX + (base + 3)] = gQTg;
-            Qblk[(base + 4) * NX + (base + 4)] = gQBeta;
+            const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
+            for (int i = 0; i < N_STATE; ++i)
+                for (int j = 0; j < N_STATE; ++j)
+                    Qblk[(base + i) * NX + (base + j)] = blockQ[i * N_STATE + j];
         }
         for (int p = 0; p < nCtrlH; ++p)
         {
