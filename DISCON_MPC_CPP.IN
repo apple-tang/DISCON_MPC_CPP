@@ -25,23 +25,25 @@ GFu.csv
 5
 ! Line 13 : N_CTRL_H
 5
-! Line 14 : Q_OMEGA
+! Line 14 : MPC_DT [s]
+0.001
+! Line 15 : Q_OMEGA
 22.9
-! Line 15 : Q_X
+! Line 16 : Q_X
 40.0
-! Line 16 : Q_V
+! Line 17 : Q_V
 80.0
-! Line 17 : Q_TG
+! Line 18 : Q_TG
 1.0e-6
-! Line 18 : Q_BETA
+! Line 19 : Q_BETA
 10.0
-! Line 19 : R_T
+! Line 20 : R_T
 1.0e-9
-! Line 20 : R_B
+! Line 21 : R_B
 120.0
-! Line 21 : OMEGA_ERR_MAX [rad/s]
+! Line 22 : OMEGA_ERR_MAX [rad/s]
 2.0
-! Line 22 : TOWER_DISP_MAX [m]
+! Line 23 : TOWER_DISP_MAX [m]
 0.5
-! Line 23 : TOWER_VEL_MAX [m/s]
+! Line 24 : TOWER_VEL_MAX [m/s]
 0.5

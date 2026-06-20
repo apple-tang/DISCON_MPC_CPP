@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <string>
@@ -34,7 +35,10 @@ namespace
         float intSpdErr = 0.0f;
         float lastTimeVS = 0.0f;
         float lastTimePC = 0.0f;
+        float lastTimeMPC = 0.0f;
         float lastLidarLogTime = -1.0f;
+        int fallbackCount = 0;
+        bool lastStepUsedFallback = false;
         float VS_Slope15 = 0.0f;
         float VS_Slope25 = 0.0f;
         float VS_SySp = 0.0f;
@@ -67,9 +71,18 @@ namespace
         std::vector<float> posZ;
     };
 
+    struct LidarHistoryPoint
+    {
+        float tMeas = 0.0f;
+        float convectionWind = 0.0f;
+        float measuredSpeed = 0.0f;
+        float posX = 0.0f;
+    };
+
     ControllerState gState;
     GainTableData gTable;
     LidarPreviewData gLidar;
+    std::deque<LidarHistoryPoint> gLidarHistory;
     float gFractureTime = 30.0f;
     std::string gDebugLogPath;
     int gCurrentTerminalIndex = -1;
@@ -87,6 +100,7 @@ namespace
     constexpr float PC_REFSPD = 122.9096f;
     constexpr float CORNER_FREQ = 1.570796f;
     constexpr float ONE_PLUS_EPS = 1.0f + 1.1920929e-07f;
+    constexpr float MPC_DT_DEFAULT = 0.000125f;
     constexpr float VS_MAX_TQ = 47402.91f;    // N-m
     constexpr float VS_MIN_TQ = 0.0f;
     constexpr float VS_MAX_TQ_RATE = 15000.0f; // N-m/s
@@ -124,6 +138,9 @@ namespace
     constexpr int   LIDAR_MSR_START = 2000;  // C index for avrSWAP(2001)
     constexpr int   LIDAR_MAX_CHAN  = 500;
     constexpr float LIDAR_LOG_DT = 0.1f;     // seconds between lidar debug log entries
+    constexpr float LIDAR_MIN_CONV_WIND = 1.0f;   // minimum convection speed used in Taylor mapping [m/s]
+    constexpr float LIDAR_EVOLUTION_LENGTH = 300.0f; // decay length for preview confidence [m]
+    constexpr float LIDAR_HISTORY_MAX_AGE = 30.0f;   // seconds of lidar history kept for preview mapping
 
     // Tunable MPC weights and state-constraint limits.
     float gQOmega = 22.9f;
@@ -135,6 +152,7 @@ namespace
     float gRB = 120.0f;
     int   gNPred = 5;
     int   gNCtrlH = 5;
+    float gMpcDt = MPC_DT_DEFAULT;
     float gOmegaErrMax = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
     float gTowerVelMax = 0.5f;   // m/s
@@ -260,6 +278,53 @@ namespace
         return K;
     }
 
+    inline std::array<float, N_STATE> buildAugmentedState(
+        float time,
+        float rotSpeed,
+        float towerDispFA,
+        float towerVelFA,
+        float prevGenTorque,
+        float prevPitchCmd)
+    {
+        (void)time;
+        (void)rotSpeed;
+        const float tgRefNow = TG_REF;
+        return {
+            rotSpeed - OMEGA_REF,
+            towerDispFA,
+            towerVelFA,
+            prevGenTorque - tgRefNow,
+            prevPitchCmd - BETA_REF
+        };
+    }
+
+    inline void applyScheduledTerminalFallback(
+        float time,
+        float horWindV,
+        float rotSpeed,
+        float towerDispFA,
+        float towerVelFA,
+        float prevGenTorque,
+        float prevPitchCmd,
+        float& demandedGenTorque,
+        float& demandedPitchCmd)
+    {
+        const float rotSpeedRPM = rotSpeed * RPS2RPM;
+        const MatUN K = getScheduledTerminalK(horWindV, rotSpeedRPM);
+        const auto z = buildAugmentedState(time, rotSpeed, towerDispFA, towerVelFA, prevGenTorque, prevPitchCmd);
+
+        float deltaTg = 0.0f;
+        float deltaBeta = 0.0f;
+        for (int j = 0; j < N_STATE; ++j)
+        {
+            deltaTg += K[0 * N_STATE + j] * z[j];
+            deltaBeta += K[1 * N_STATE + j] * z[j];
+        }
+
+        demandedGenTorque = std::clamp(prevGenTorque + deltaTg, VS_MIN_TQ, VS_MAX_TQ);
+        demandedPitchCmd = std::clamp(prevPitchCmd + deltaBeta, PC_MIN_PIT, PC_MAX_PIT);
+    }
+
     inline std::string stripComment(const std::string& s)
     {
         const auto p = s.find('!');
@@ -351,15 +416,21 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
+        // extended format: 24 data lines, adds MPC_DT after N_CTRL_H
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
+        gMpcDt = MPC_DT_DEFAULT;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         if (lines.size() >= 21)
         {
             gNPred = std::stoi(lines[idx++]);
             gNCtrlH = std::stoi(lines[idx++]);
+        }
+        if (lines.size() >= 24)
+        {
+            gMpcDt = std::stof(lines[idx++]);
         }
 
         if (gNPred < 1)
@@ -377,8 +448,13 @@ namespace
             err = "N_CTRL_H must be less than or equal to N_PRED.";
             return false;
         }
+        if (gMpcDt <= 0.0f)
+        {
+            err = "MPC_DT must be greater than zero.";
+            return false;
+        }
 
-        if (lines.size() >= 23)
+        if (lines.size() >= 24)
         {
             if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
             if (lines.size() > idx) gQX = std::stof(lines[idx++]);
@@ -446,22 +522,75 @@ namespace
         }
     }
 
-    inline std::vector<float> buildWindPreviewDeltas(
-        const LidarPreviewData& lidar,
+    inline void updateLidarHistory(
+        float time,
         float currentWind,
-        int nPred)
+        const LidarPreviewData& lidar)
+    {
+        while (!gLidarHistory.empty() && (time - gLidarHistory.front().tMeas) > LIDAR_HISTORY_MAX_AGE)
+            gLidarHistory.pop_front();
+
+        if (!lidar.available || lidar.measuredSpeeds.empty()) return;
+
+        const float convectionWind = std::max(std::fabs(currentWind), LIDAR_MIN_CONV_WIND);
+        for (std::size_t i = 0; i < lidar.measuredSpeeds.size(); ++i)
+        {
+            LidarHistoryPoint point;
+            point.tMeas = time;
+            point.convectionWind = convectionWind;
+            point.measuredSpeed = lidar.measuredSpeeds[i];
+            point.posX = (i < lidar.posX.size()) ? lidar.posX[i] : 0.0f;
+            gLidarHistory.push_back(point);
+        }
+    }
+
+    inline std::vector<float> buildWindPreviewDeltas(
+        float currentTime,
+        float currentWind,
+        int nPred,
+        float dtPred,
+        bool& usedLidarHistory)
     {
         std::vector<float> dWindPreview(static_cast<std::size_t>(std::max(nPred, 0)), 0.0f);
-        if (!lidar.available || lidar.measuredSpeeds.empty()) return dWindPreview;
+        usedLidarHistory = false;
+        if (nPred <= 0 || dtPred <= 0.0f || gLidarHistory.empty()) return dWindPreview;
 
-        // Reference implementation path:
-        // use the arithmetic mean of all lidar measured speeds as a simple
-        // preview estimate and assume it stays constant over the horizon.
-        float sumWind = 0.0f;
-        for (float v : lidar.measuredSpeeds) sumWind += v;
-        const float previewMeanWind = sumWind / static_cast<float>(lidar.measuredSpeeds.size());
-        const float previewDelta = previewMeanWind - currentWind;
-        std::fill(dWindPreview.begin(), dWindPreview.end(), previewDelta);
+        std::vector<float> weightSum(static_cast<std::size_t>(nPred), 0.0f);
+
+        for (const auto& pt : gLidarHistory)
+        {
+            const float xPos = pt.posX;
+            const float distanceAhead = std::max(0.0f, -xPos);
+            const float convectionWind = std::max(std::fabs(pt.convectionWind), LIDAR_MIN_CONV_WIND);
+            const float tArrive = pt.tMeas + distanceAhead / convectionWind;
+            const float futureTime = tArrive - currentTime;
+            if (futureTime < 0.0f) continue;
+
+            const int stepOffset = static_cast<int>(std::lround(futureTime / dtPred));
+            if (stepOffset < 0) continue;
+            const int p = std::min(stepOffset, std::max(nPred - 1, 0));
+            const float decay = std::exp(-distanceAhead / LIDAR_EVOLUTION_LENGTH);
+            const float delta = decay * (pt.measuredSpeed - currentWind);
+            dWindPreview[static_cast<std::size_t>(p)] += delta;
+            weightSum[static_cast<std::size_t>(p)] += decay;
+        }
+
+        float lastValid = 0.0f;
+        bool anyAssigned = false;
+        for (int p = 0; p < nPred; ++p)
+        {
+            if (weightSum[static_cast<std::size_t>(p)] > 1.0e-8f)
+            {
+                dWindPreview[static_cast<std::size_t>(p)] /= weightSum[static_cast<std::size_t>(p)];
+                lastValid = dWindPreview[static_cast<std::size_t>(p)];
+                anyAssigned = true;
+            }
+            else
+            {
+                dWindPreview[static_cast<std::size_t>(p)] = lastValid;
+            }
+        }
+        usedLidarHistory = anyAssigned;
         return dWindPreview;
     }
 
@@ -518,6 +647,7 @@ namespace
         std::ostringstream cfg;
         cfg << "# N_PRED=" << gNPred
             << ", N_CTRL_H=" << gNCtrlH
+            << ", MPC_DT=" << gMpcDt
             << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
             << ", R=[" << gRT << "," << gRB << "]"
             << ", limits=[omegaErrMax=" << gOmegaErrMax
@@ -639,6 +769,7 @@ namespace
         gState.lastTime = time;
         gState.lastTimePC = time - PC_DT;
         gState.lastTimeVS = time - VS_DT;
+        gState.lastTimeMPC = time - gMpcDt;
         gState.VS_SySp = VS_RtGnSp / (1.0f + 0.01f * VS_SlPc);
         gState.VS_Slope15 = (VS_Rgn2K * VS_Rgn2Sp * VS_Rgn2Sp) / (VS_Rgn2Sp - VS_CtInSp);
         gState.VS_Slope25 = (VS_RtPwr / VS_RtGnSp) / (VS_RtGnSp - gState.VS_SySp);
@@ -729,7 +860,8 @@ namespace
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
             [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
         const float dWind = horWindV - windRef;
-        const std::vector<float> dWindPreview = buildWindPreviewDeltas(lidar, horWindV, nPred);
+        bool usedLidarHistory = false;
+        const std::vector<float> dWindPreview = buildWindPreviewDeltas(time, horWindV, nPred, dt, usedLidarHistory);
 
         const float gTOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTomega, horWindV, rotSpeedRPM) : G_TOMEGA_DEFAULT;
         const float gTBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTbeta, horWindV, rotSpeedRPM) : G_TBETA_DEFAULT;
@@ -1086,7 +1218,11 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
         gState.lastPitchRate = 0.0f;
+        gState.lastTimeMPC = time - gMpcDt;
         gState.lastLidarLogTime = -1.0f;
+        gState.fallbackCount = 0;
+        gState.lastStepUsedFallback = false;
+        gLidarHistory.clear();
 
         std::string loadErr;
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
@@ -1103,7 +1239,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         {
             std::ostringstream oss;
             oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
-                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ").";
+                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ", MPC_DT=" << gMpcDt << " s).";
             writeMessage(avcMSG, msgLen, oss.str());
         }
         else
@@ -1116,6 +1252,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
 
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
+    updateLidarHistory(time, horWindV, gLidar);
 
     if (!gState.fractureActive && time >= gFractureTime)
     {
@@ -1142,7 +1279,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         std::string qpErr;
         const bool qpSolved = solveMultiStepMPC(
             time,
-            dt,
+            gMpcDt,
             rotSpeed,
             horWindV,
             towerDispFA,
@@ -1157,9 +1294,25 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 
         if (!qpSolved)
         {
-            *aviFAIL = -1;
-            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES multi-step MPC QP failed inside DISCON." : qpErr);
-            return;
+            applyScheduledTerminalFallback(
+                time,
+                horWindV,
+                rotSpeed,
+                towerDispFA,
+                towerVelFA,
+                gState.lastGenTorque,
+                gState.pitchCmd,
+                demandedGenTorque,
+                demandedPitch
+            );
+            gState.lastStepUsedFallback = true;
+            gState.fallbackCount += 1;
+            *aviFAIL = 1;
+            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
+        }
+        else
+        {
+            gState.lastStepUsedFallback = false;
         }
     }
 
@@ -1193,15 +1346,16 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         const float lidarMeanWind = getLidarMeanWind(gLidar, horWindV);
         const float lidarPreviewDelta = lidarMeanWind - horWindV;
+        const bool usingLidarPreview = !gLidarHistory.empty();
         oss << "MPC shutdown active: Tg=" << demandedGenTorque
             << " Nm, TgRef=" << tgRefNow
             << " Nm, beta=" << demandedPitch * R2D
             << " deg, dBeta=" << demandedPitchRate * R2D
             << " deg/s, wind=" << horWindV << " m/s"
             << ", lidarAvail=" << (gLidar.available ? 1 : 0)
-            << ", lidarPts=" << gLidar.measuredSpeeds.size()
-            << ", lidarMean=" << lidarMeanWind
-            << " m/s, lidarDelta=" << lidarPreviewDelta << " m/s";
+                << ", lidarPts=" << gLidar.measuredSpeeds.size()
+                << ", lidarMean=" << lidarMeanWind
+                << " m/s, lidarDelta=" << lidarPreviewDelta << " m/s";
 
         if (gState.lastLidarLogTime < 0.0f || (time - gState.lastLidarLogTime) >= LIDAR_LOG_DT)
         {
@@ -1213,7 +1367,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 << ", lidarPts=" << gLidar.measuredSpeeds.size()
                 << ", lidarMean=" << lidarMeanWind
                 << ", lidarDelta=" << lidarPreviewDelta
+                << ", previewSource=" << (usingLidarPreview ? "lidar-history" : "fallback-constant")
                 << ", terminalIdx=" << gCurrentTerminalIndex
+                << ", fallbackUsed=" << (gState.lastStepUsedFallback ? 1 : 0)
+                << ", fallbackCount=" << gState.fallbackCount
                 << ", Tg=" << demandedGenTorque
                 << ", betaDeg=" << demandedPitch * R2D;
             appendDebugLog(gDebugLogPath, dbg.str());
