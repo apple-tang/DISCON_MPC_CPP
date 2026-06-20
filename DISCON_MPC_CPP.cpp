@@ -3,9 +3,11 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <string>
 #include <sstream>
 #include <vector>
+#include <ctime>
 
 #include <qpOASES.hpp>
 #include "terminal_mpc_schedule.hpp"
@@ -70,6 +72,7 @@ namespace
     LidarPreviewData gLidar;
     float gFractureTime = 30.0f;
     std::string gDebugLogPath;
+    int gCurrentTerminalIndex = -1;
 
     constexpr float D2R = 0.017453292f;
     constexpr float R2D = 57.295780f;
@@ -479,6 +482,56 @@ namespace
         out << line << '\n';
     }
 
+    inline void resetDebugLog(const std::string& path)
+    {
+        if (path.empty()) return;
+        std::ofstream out(path, std::ios::trunc);
+        if (!out) return;
+    }
+
+    inline std::string makeTimestampString()
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm tmNow{};
+#ifdef _WIN32
+        localtime_s(&tmNow, &now);
+#else
+        tmNow = *std::localtime(&now);
+#endif
+        std::ostringstream oss;
+        oss << (tmNow.tm_year + 1900) << "-"
+            << std::setw(2) << std::setfill('0') << (tmNow.tm_mon + 1) << "-"
+            << std::setw(2) << std::setfill('0') << tmNow.tm_mday << " "
+            << std::setw(2) << std::setfill('0') << tmNow.tm_hour << ":"
+            << std::setw(2) << std::setfill('0') << tmNow.tm_min << ":"
+            << std::setw(2) << std::setfill('0') << tmNow.tm_sec;
+        return oss.str();
+    }
+
+    inline void writeDebugLogHeader(const std::string& path)
+    {
+        if (path.empty()) return;
+        resetDebugLog(path);
+        appendDebugLog(path, "# DISCON_MPC_CPP lidar debug log");
+        appendDebugLog(path, "# generated_at=" + makeTimestampString());
+
+        std::ostringstream cfg;
+        cfg << "# N_PRED=" << gNPred
+            << ", N_CTRL_H=" << gNCtrlH
+            << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
+            << ", R=[" << gRT << "," << gRB << "]"
+            << ", limits=[omegaErrMax=" << gOmegaErrMax
+            << ", towerDispMax=" << gTowerDispMax
+            << ", towerVelMax=" << gTowerVelMax << "]";
+        appendDebugLog(path, cfg.str());
+
+        std::ostringstream sched;
+        sched << "# terminal_schedule_points=" << kTerminalNumPoints
+              << ", wind_grid=" << kTerminalNumWind
+              << ", speed_grid=" << kTerminalNumSpeed;
+        appendDebugLog(path, sched.str());
+    }
+
     inline float interp2d(
         const std::vector<float>& windPts,
         const std::vector<float>& speedPts,
@@ -671,6 +724,7 @@ namespace
         const int nPred = gNPred;
         const int nCtrlH = gNCtrlH;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
+        gCurrentTerminalIndex = lookupTerminalScheduleIndex(horWindV, rotSpeedRPM);
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
             [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
@@ -1039,6 +1093,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         const std::string outRoot = cArrayToString(avcOUTNAME, outNameLen);
         gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
+        writeDebugLogHeader(gDebugLogPath);
 
         if (tablesLoaded)
             initializeBaselineStates(time, genSpeed, bladePitch1);
@@ -1153,10 +1208,12 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             std::ostringstream dbg;
             dbg << "time=" << time
                 << ", wind=" << horWindV
+                << ", rotSpeedRpm=" << rotSpeed * RPS2RPM
                 << ", lidarAvail=" << (gLidar.available ? 1 : 0)
                 << ", lidarPts=" << gLidar.measuredSpeeds.size()
                 << ", lidarMean=" << lidarMeanWind
                 << ", lidarDelta=" << lidarPreviewDelta
+                << ", terminalIdx=" << gCurrentTerminalIndex
                 << ", Tg=" << demandedGenTorque
                 << ", betaDeg=" << demandedPitch * R2D;
             appendDebugLog(gDebugLogPath, dbg.str());
