@@ -35,7 +35,6 @@ namespace
         float intSpdErr = 0.0f;
         float lastTimeVS = 0.0f;
         float lastTimePC = 0.0f;
-        float lastTimeMPC = 0.0f;
         float lastLidarLogTime = -1.0f;
         int fallbackCount = 0;
         bool lastStepUsedFallback = false;
@@ -100,7 +99,6 @@ namespace
     constexpr float PC_REFSPD = 122.9096f;
     constexpr float CORNER_FREQ = 1.570796f;
     constexpr float ONE_PLUS_EPS = 1.0f + 1.1920929e-07f;
-    constexpr float MPC_DT_DEFAULT = 0.000125f;
     constexpr float VS_MAX_TQ = 47402.91f;    // N-m
     constexpr float VS_MIN_TQ = 0.0f;
     constexpr float VS_MAX_TQ_RATE = 15000.0f; // N-m/s
@@ -152,7 +150,6 @@ namespace
     float gRB = 120.0f;
     int   gNPred = 5;
     int   gNCtrlH = 5;
-    float gMpcDt = MPC_DT_DEFAULT;
     float gOmegaErrMax = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
     float gTowerVelMax = 0.5f;   // m/s
@@ -416,21 +413,15 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
-        // extended format: 24 data lines, adds MPC_DT after N_CTRL_H
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
-        gMpcDt = MPC_DT_DEFAULT;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         if (lines.size() >= 21)
         {
             gNPred = std::stoi(lines[idx++]);
             gNCtrlH = std::stoi(lines[idx++]);
-        }
-        if (lines.size() >= 24)
-        {
-            gMpcDt = std::stof(lines[idx++]);
         }
 
         if (gNPred < 1)
@@ -448,13 +439,8 @@ namespace
             err = "N_CTRL_H must be less than or equal to N_PRED.";
             return false;
         }
-        if (gMpcDt <= 0.0f)
-        {
-            err = "MPC_DT must be greater than zero.";
-            return false;
-        }
 
-        if (lines.size() >= 24)
+        if (lines.size() >= 23)
         {
             if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
             if (lines.size() > idx) gQX = std::stof(lines[idx++]);
@@ -647,7 +633,6 @@ namespace
         std::ostringstream cfg;
         cfg << "# N_PRED=" << gNPred
             << ", N_CTRL_H=" << gNCtrlH
-            << ", MPC_DT=" << gMpcDt
             << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
             << ", R=[" << gRT << "," << gRB << "]"
             << ", limits=[omegaErrMax=" << gOmegaErrMax
@@ -769,7 +754,6 @@ namespace
         gState.lastTime = time;
         gState.lastTimePC = time - PC_DT;
         gState.lastTimeVS = time - VS_DT;
-        gState.lastTimeMPC = time - gMpcDt;
         gState.VS_SySp = VS_RtGnSp / (1.0f + 0.01f * VS_SlPc);
         gState.VS_Slope15 = (VS_Rgn2K * VS_Rgn2Sp * VS_Rgn2Sp) / (VS_Rgn2Sp - VS_CtInSp);
         gState.VS_Slope25 = (VS_RtPwr / VS_RtGnSp) / (VS_RtGnSp - gState.VS_SySp);
@@ -1218,7 +1202,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
         gState.lastPitchRate = 0.0f;
-        gState.lastTimeMPC = time - gMpcDt;
         gState.lastLidarLogTime = -1.0f;
         gState.fallbackCount = 0;
         gState.lastStepUsedFallback = false;
@@ -1239,7 +1222,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         {
             std::ostringstream oss;
             oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
-                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ", MPC_DT=" << gMpcDt << " s).";
+                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }
         else
@@ -1279,7 +1262,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         std::string qpErr;
         const bool qpSolved = solveMultiStepMPC(
             time,
-            gMpcDt,
+            dt,
             rotSpeed,
             horWindV,
             towerDispFA,
