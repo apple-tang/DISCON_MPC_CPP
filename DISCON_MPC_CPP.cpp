@@ -84,6 +84,7 @@ namespace
     std::deque<LidarHistoryPoint> gLidarHistory;
     float gFractureTime = 30.0f;
     std::string gDebugLogPath;
+    std::string gPredictionLogPath;
     int gCurrentTerminalIndex = -1;
 
     constexpr float D2R = 0.017453292f;
@@ -647,6 +648,45 @@ namespace
         appendDebugLog(path, sched.str());
     }
 
+    inline void writePredictionLogHeader(const std::string& path)
+    {
+        if (path.empty()) return;
+        resetDebugLog(path);
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << "time,horizon_step,pred_time,dOmega_pred,x_t_pred,v_t_pred,"
+               "dOmega_meas,x_t_meas,v_t_meas,wind_meas\n";
+    }
+
+    inline void appendPredictionLogRow(
+        const std::string& path,
+        float time,
+        int horizonStep,
+        float predTime,
+        float dOmegaPred,
+        float xPred,
+        float vPred,
+        float dOmegaMeas,
+        float xMeas,
+        float vMeas,
+        float windMeas)
+    {
+        if (path.empty()) return;
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << std::fixed << std::setprecision(6)
+            << time << ','
+            << horizonStep << ','
+            << predTime << ','
+            << dOmegaPred << ','
+            << xPred << ','
+            << vPred << ','
+            << dOmegaMeas << ','
+            << xMeas << ','
+            << vMeas << ','
+            << windMeas << '\n';
+    }
+
     inline float interp2d(
         const std::vector<float>& windPts,
         const std::vector<float>& speedPts,
@@ -1156,6 +1196,35 @@ namespace
 
         demandedGenTorque = std::clamp(prevGenTorque + dTg, VS_MIN_TQ, VS_MAX_TQ);
         demandedPitchCmd = std::clamp(prevPitchCmd + dBeta, PC_MIN_PIT, PC_MAX_PIT);
+
+        for (int p = 0; p < nPred; ++p)
+        {
+            const int xBase = p * N_STATE;
+            float dOmegaPred = c[xBase + 0];
+            float xPred = c[xBase + 1];
+            float vPred = c[xBase + 2];
+            for (int j = 0; j < NU; ++j)
+            {
+                dOmegaPred += G[(xBase + 0) * NU + j] * static_cast<float>(xOpt[j]);
+                xPred += G[(xBase + 1) * NU + j] * static_cast<float>(xOpt[j]);
+                vPred += G[(xBase + 2) * NU + j] * static_cast<float>(xOpt[j]);
+            }
+
+            appendPredictionLogRow(
+                gPredictionLogPath,
+                time,
+                p + 1,
+                time + static_cast<float>(p + 1) * dt,
+                dOmegaPred,
+                xPred,
+                vPred,
+                x0,
+                x1,
+                x2,
+                horWindV
+            );
+        }
+
         return true;
     }
 }
@@ -1211,8 +1280,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
         const std::string outRoot = cArrayToString(avcOUTNAME, outNameLen);
         gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
+        gPredictionLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_prediction.csv");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
         writeDebugLogHeader(gDebugLogPath);
+        writePredictionLogHeader(gPredictionLogPath);
 
         if (tablesLoaded)
             initializeBaselineStates(time, genSpeed, bladePitch1);
