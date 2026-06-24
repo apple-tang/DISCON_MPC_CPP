@@ -45,3 +45,5 @@ GFu.csv
 0.5
 ! Line 23 : TOWER_VEL_MAX [m/s]
 0.5
+! Line 24 : enable trace files {0: off, 1: on}
+1

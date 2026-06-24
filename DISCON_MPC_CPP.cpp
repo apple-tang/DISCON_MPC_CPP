@@ -85,6 +85,8 @@ namespace
     float gFractureTime = 30.0f;
     std::string gDebugLogPath;
     std::string gPredictionLogPath;
+    std::string gInputTracePath;
+    bool gEnableTraceFiles = true;
     int gCurrentTerminalIndex = -1;
 
     constexpr float D2R = 0.017453292f;
@@ -414,11 +416,13 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
+        // newest format: 24 data lines, line 24 toggles trace-file generation
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
+        gEnableTraceFiles = true;
         if (lines.size() >= 21)
         {
             gNPred = std::stoi(lines[idx++]);
@@ -464,6 +468,11 @@ namespace
             if (lines.size() > idx) gOmegaErrMax = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerVelMax = std::stof(lines[idx++]);
+        }
+
+        if (lines.size() > idx)
+        {
+            gEnableTraceFiles = (std::stoi(lines[idx++]) != 0);
         }
 
         gTable.loaded = true;
@@ -592,6 +601,7 @@ namespace
 
     inline void appendDebugLog(const std::string& path, const std::string& line)
     {
+        if (!gEnableTraceFiles) return;
         if (path.empty()) return;
         std::ofstream out(path, std::ios::app);
         if (!out) return;
@@ -600,6 +610,7 @@ namespace
 
     inline void resetDebugLog(const std::string& path)
     {
+        if (!gEnableTraceFiles) return;
         if (path.empty()) return;
         std::ofstream out(path, std::ios::trunc);
         if (!out) return;
@@ -650,6 +661,7 @@ namespace
 
     inline void writePredictionLogHeader(const std::string& path)
     {
+        if (!gEnableTraceFiles) return;
         if (path.empty()) return;
         resetDebugLog(path);
         std::ofstream out(path, std::ios::app);
@@ -671,6 +683,7 @@ namespace
         float vMeas,
         float windMeas)
     {
+        if (!gEnableTraceFiles) return;
         if (path.empty()) return;
         std::ofstream out(path, std::ios::app);
         if (!out) return;
@@ -685,6 +698,49 @@ namespace
             << xMeas << ','
             << vMeas << ','
             << windMeas << '\n';
+    }
+
+    inline void writeInputTraceHeader(const std::string& path)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        resetDebugLog(path);
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << "time,iStatus,fracture_active,rotSpeed,horWindV,"
+               "avr_1019_towerVelFA,avr_1020_towerVelSS,avr_1021_towerDispFA,"
+               "out_rotSpeed_rads,out_towerVelFA,out_towerDispFA\n";
+    }
+
+    inline void appendInputTraceRow(
+        const std::string& path,
+        float time,
+        int iStatus,
+        bool fractureActive,
+        float rotSpeed,
+        float horWindV,
+        float avrTowerVelFA,
+        float avrTowerVelSS,
+        float avrTowerDispFA,
+        float towerVelFA,
+        float towerDispFA)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << std::fixed << std::setprecision(6)
+            << time << ','
+            << iStatus << ','
+            << (fractureActive ? 1 : 0) << ','
+            << rotSpeed << ','
+            << horWindV << ','
+            << avrTowerVelFA << ','
+            << avrTowerVelSS << ','
+            << avrTowerDispFA << ','
+            << rotSpeed << ','
+            << towerVelFA << ','
+            << towerDispFA << '\n';
     }
 
     inline float interp2d(
@@ -1281,9 +1337,11 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         const std::string outRoot = cArrayToString(avcOUTNAME, outNameLen);
         gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
         gPredictionLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_prediction.csv");
+        gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
         writeDebugLogHeader(gDebugLogPath);
         writePredictionLogHeader(gPredictionLogPath);
+        writeInputTraceHeader(gInputTracePath);
 
         if (tablesLoaded)
             initializeBaselineStates(time, genSpeed, bladePitch1);
@@ -1312,6 +1370,20 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     {
         gState.fractureActive = true;
     }
+
+    appendInputTraceRow(
+        gInputTracePath,
+        time,
+        iStatus,
+        gState.fractureActive,
+        rotSpeed,
+        horWindV,
+        avrSWAP[1018],
+        avrSWAP[1019],
+        avrSWAP[1020],
+        towerVelFA,
+        towerDispFA
+    );
 
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
@@ -1388,28 +1460,11 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     gState.pitchCmd = demandedPitch;
     gState.lastPitchRate = demandedPitchRate;
 
-    std::ostringstream oss;
-    if (!gState.fractureActive)
+    if (gState.fractureActive)
     {
-        oss << "baseline control active: Tg=" << demandedGenTorque
-            << " Nm, beta=" << demandedPitch * R2D
-            << " deg, dBeta=" << demandedPitchRate * R2D << " deg/s";
-    }
-    else
-    {
-        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
         const float lidarMeanWind = getLidarMeanWind(gLidar, horWindV);
         const float lidarPreviewDelta = lidarMeanWind - horWindV;
         const bool usingLidarPreview = !gLidarHistory.empty();
-        oss << "MPC shutdown active: Tg=" << demandedGenTorque
-            << " Nm, TgRef=" << tgRefNow
-            << " Nm, beta=" << demandedPitch * R2D
-            << " deg, dBeta=" << demandedPitchRate * R2D
-            << " deg/s, wind=" << horWindV << " m/s"
-            << ", lidarAvail=" << (gLidar.available ? 1 : 0)
-                << ", lidarPts=" << gLidar.measuredSpeeds.size()
-                << ", lidarMean=" << lidarMeanWind
-                << " m/s, lidarDelta=" << lidarPreviewDelta << " m/s";
 
         if (gState.lastLidarLogTime < 0.0f || (time - gState.lastLidarLogTime) >= LIDAR_LOG_DT)
         {
@@ -1431,5 +1486,4 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             gState.lastLidarLogTime = time;
         }
     }
-    writeMessage(avcMSG, msgLen, oss.str());
 }
