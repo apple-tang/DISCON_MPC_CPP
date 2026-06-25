@@ -836,8 +836,12 @@ namespace
 
     inline float getGeneratorTorqueReference(float time, float rotSpeed)
     {
-        (void)time;
-        (void)rotSpeed;
+        const float tau = time - gFractureTime;
+        if (tau <= 0.0f)
+            return TG_REF;
+        const float rotSpeedRPM = rotSpeed * RPS2RPM;
+        if (rotSpeedRPM > 3.0f)
+            return VS_MAX_TQ;
         return TG_REF;
     }
 
