@@ -86,6 +86,7 @@ namespace
     std::string gDebugLogPath;
     std::string gPredictionLogPath;
     std::string gInputTracePath;
+    std::string gTuningTracePath;
     bool gEnableTraceFiles = true;
     int gCurrentTerminalIndex = -1;
 
@@ -743,6 +744,120 @@ namespace
             << towerDispFA << '\n';
     }
 
+    inline void writeTuningTraceHeader(const std::string& path)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        resetDebugLog(path);
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << "time,fracture_active,qp_solved,fallback_used,fallback_count,terminal_idx,"
+               "rotSpeed_rpm,rotSpeed_rads,towerDispFA,towerVelFA,horWindV,dWind,"
+               "tg_ref,beta_ref,prevGenTorque,prevPitchCmd,demandedGenTorque,demandedPitch,"
+               "deltaTg_cmd,deltaBeta_cmd,"
+               "x0_dOmega,x1_xt,x2_vt,x3_tgerr,x4_betaerr,"
+               "J_total,J_omega,J_x,J_v,J_tg,J_beta,J_du_tg,J_du_beta,J_terminal,"
+               "Qomega_eff,Qx_eff,Qv_eff,QTg_eff,QBeta_eff,RT_eff,RB_eff,"
+               "pred_max_abs_dOmega,pred_max_abs_xt,pred_max_abs_vt,"
+               "trace_note\n";
+    }
+
+    inline void appendTuningTraceRow(
+        const std::string& path,
+        float time,
+        bool fractureActive,
+        bool qpSolved,
+        bool fallbackUsed,
+        int fallbackCount,
+        int terminalIdx,
+        float rotSpeedRpm,
+        float rotSpeedRads,
+        float towerDispFA,
+        float towerVelFA,
+        float horWindV,
+        float dWind,
+        float tgRefNow,
+        float betaRefNow,
+        float prevGenTorque,
+        float prevPitchCmd,
+        float demandedGenTorque,
+        float demandedPitch,
+        float deltaTgCmd,
+        float deltaBetaCmd,
+        const std::array<float, N_STATE>& xbar0,
+        float Jtotal,
+        float Jomega,
+        float Jx,
+        float Jv,
+        float Jtg,
+        float Jbeta,
+        float JduTg,
+        float JduBeta,
+        float Jterminal,
+        float qOmegaEff,
+        float qXEff,
+        float qVEff,
+        float qTgEff,
+        float qBetaEff,
+        float rTEff,
+        float rBEff,
+        float predMaxAbsDOmega,
+        float predMaxAbsXt,
+        float predMaxAbsVt,
+        const std::string& note)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << std::fixed << std::setprecision(6)
+            << time << ','
+            << (fractureActive ? 1 : 0) << ','
+            << (qpSolved ? 1 : 0) << ','
+            << (fallbackUsed ? 1 : 0) << ','
+            << fallbackCount << ','
+            << terminalIdx << ','
+            << rotSpeedRpm << ','
+            << rotSpeedRads << ','
+            << towerDispFA << ','
+            << towerVelFA << ','
+            << horWindV << ','
+            << dWind << ','
+            << tgRefNow << ','
+            << betaRefNow << ','
+            << prevGenTorque << ','
+            << prevPitchCmd << ','
+            << demandedGenTorque << ','
+            << demandedPitch << ','
+            << deltaTgCmd << ','
+            << deltaBetaCmd << ','
+            << xbar0[0] << ','
+            << xbar0[1] << ','
+            << xbar0[2] << ','
+            << xbar0[3] << ','
+            << xbar0[4] << ','
+            << Jtotal << ','
+            << Jomega << ','
+            << Jx << ','
+            << Jv << ','
+            << Jtg << ','
+            << Jbeta << ','
+            << JduTg << ','
+            << JduBeta << ','
+            << Jterminal << ','
+            << qOmegaEff << ','
+            << qXEff << ','
+            << qVEff << ','
+            << qTgEff << ','
+            << qBetaEff << ','
+            << rTEff << ','
+            << rBEff << ','
+            << predMaxAbsDOmega << ','
+            << predMaxAbsXt << ','
+            << predMaxAbsVt << ','
+            << note << '\n';
+    }
+
     inline float interp2d(
         const std::vector<float>& windPts,
         const std::vector<float>& speedPts,
@@ -1253,6 +1368,18 @@ namespace
         demandedGenTorque = std::clamp(prevGenTorque + dTg, VS_MIN_TQ, VS_MAX_TQ);
         demandedPitchCmd = std::clamp(prevPitchCmd + dBeta, PC_MIN_PIT, PC_MAX_PIT);
 
+        float Jomega = 0.0f;
+        float Jx = 0.0f;
+        float Jv = 0.0f;
+        float Jtg = 0.0f;
+        float Jbeta = 0.0f;
+        float JduTg = 0.0f;
+        float JduBeta = 0.0f;
+        float Jterminal = 0.0f;
+        float predMaxAbsDOmega = 0.0f;
+        float predMaxAbsXt = 0.0f;
+        float predMaxAbsVt = 0.0f;
+
         for (int p = 0; p < nPred; ++p)
         {
             const int xBase = p * N_STATE;
@@ -1264,6 +1391,43 @@ namespace
                 dOmegaPred += G[(xBase + 0) * NU + j] * static_cast<float>(xOpt[j]);
                 xPred += G[(xBase + 1) * NU + j] * static_cast<float>(xOpt[j]);
                 vPred += G[(xBase + 2) * NU + j] * static_cast<float>(xOpt[j]);
+            }
+
+            predMaxAbsDOmega = std::max(predMaxAbsDOmega, std::fabs(dOmegaPred));
+            predMaxAbsXt = std::max(predMaxAbsXt, std::fabs(xPred));
+            predMaxAbsVt = std::max(predMaxAbsVt, std::fabs(vPred));
+
+            const float qOmegaStage = Qblk[(xBase + 0) * NX + (xBase + 0)];
+            const float qXStage = Qblk[(xBase + 1) * NX + (xBase + 1)];
+            const float qVStage = Qblk[(xBase + 2) * NX + (xBase + 2)];
+            const float qTgStage = Qblk[(xBase + 3) * NX + (xBase + 3)];
+            const float qBetaStage = Qblk[(xBase + 4) * NX + (xBase + 4)];
+
+            float tgErrPred = 0.0f;
+            float betaErrPred = 0.0f;
+            for (int j = 0; j < NU; ++j)
+            {
+                tgErrPred += G[(xBase + 3) * NU + j] * static_cast<float>(xOpt[j]);
+                betaErrPred += G[(xBase + 4) * NU + j] * static_cast<float>(xOpt[j]);
+            }
+            tgErrPred += c[xBase + 3];
+            betaErrPred += c[xBase + 4];
+
+            if (p == nPred - 1)
+            {
+                Jterminal += qOmegaStage * dOmegaPred * dOmegaPred;
+                Jterminal += qXStage * xPred * xPred;
+                Jterminal += qVStage * vPred * vPred;
+                Jterminal += qTgStage * tgErrPred * tgErrPred;
+                Jterminal += qBetaStage * betaErrPred * betaErrPred;
+            }
+            else
+            {
+                Jomega += qOmegaStage * dOmegaPred * dOmegaPred;
+                Jx += qXStage * xPred * xPred;
+                Jv += qVStage * vPred * vPred;
+                Jtg += qTgStage * tgErrPred * tgErrPred;
+                Jbeta += qBetaStage * betaErrPred * betaErrPred;
             }
 
             appendPredictionLogRow(
@@ -1280,6 +1444,60 @@ namespace
                 horWindV
             );
         }
+
+        for (int p = 0; p < nCtrlH; ++p)
+        {
+            const float duTg = static_cast<float>(xOpt[p * N_CTRL + 0]);
+            const float duBeta = static_cast<float>(xOpt[p * N_CTRL + 1]);
+            JduTg += gRT * duTg * duTg;
+            JduBeta += gRB * duBeta * duBeta;
+        }
+
+        const float Jtotal = Jomega + Jx + Jv + Jtg + Jbeta + JduTg + JduBeta + Jterminal;
+        appendTuningTraceRow(
+            gTuningTracePath,
+            time,
+            gState.fractureActive,
+            true,
+            false,
+            gState.fallbackCount,
+            gCurrentTerminalIndex,
+            rotSpeedRPM,
+            rotSpeed,
+            towerDispFA,
+            towerVelFA,
+            horWindV,
+            dWind,
+            tgRefNow,
+            BETA_REF,
+            prevGenTorque,
+            prevPitchCmd,
+            demandedGenTorque,
+            demandedPitchCmd,
+            dTg,
+            dBeta,
+            xbar0,
+            Jtotal,
+            Jomega,
+            Jx,
+            Jv,
+            Jtg,
+            Jbeta,
+            JduTg,
+            JduBeta,
+            Jterminal,
+            gQOmega,
+            gQX,
+            gQV,
+            gQTg,
+            gQBeta,
+            gRT,
+            gRB,
+            predMaxAbsDOmega,
+            predMaxAbsXt,
+            predMaxAbsVt,
+            "qp"
+        );
 
         return true;
     }
@@ -1338,10 +1556,12 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
         gPredictionLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_prediction.csv");
         gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
+        gTuningTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_tuning_trace.csv");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
         writeDebugLogHeader(gDebugLogPath);
         writePredictionLogHeader(gPredictionLogPath);
         writeInputTraceHeader(gInputTracePath);
+        writeTuningTraceHeader(gTuningTracePath);
 
         if (tablesLoaded)
             initializeBaselineStates(time, genSpeed, bladePitch1);
@@ -1435,6 +1655,55 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             gState.fallbackCount += 1;
             *aviFAIL = 1;
             writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
+
+            const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
+            const std::array<float, N_STATE> z = buildAugmentedState(
+                time, rotSpeed, towerDispFA, towerVelFA, gState.lastGenTorque, gState.pitchCmd
+            );
+            appendTuningTraceRow(
+                gTuningTracePath,
+                time,
+                gState.fractureActive,
+                false,
+                true,
+                gState.fallbackCount,
+                gCurrentTerminalIndex,
+                rotSpeed * RPS2RPM,
+                rotSpeed,
+                towerDispFA,
+                towerVelFA,
+                horWindV,
+                0.0f,
+                tgRefNow,
+                BETA_REF,
+                gState.lastGenTorque,
+                gState.pitchCmd,
+                demandedGenTorque,
+                demandedPitch,
+                demandedGenTorque - gState.lastGenTorque,
+                demandedPitch - gState.pitchCmd,
+                z,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                gQOmega,
+                gQX,
+                gQV,
+                gQTg,
+                gQBeta,
+                gRT,
+                gRB,
+                0.0f,
+                0.0f,
+                0.0f,
+                "fallback"
+            );
         }
         else
         {
