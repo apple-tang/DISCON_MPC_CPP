@@ -22,7 +22,7 @@ GFu.csv
 ! Line 11 : fracture switch time [s]
 30.0
 ! Line 12 : N_PRED
-5
+200
 ! Line 13 : N_CTRL_H
 5
 ! Line 14 : Q_OMEGA
@@ -45,5 +45,7 @@ GFu.csv
 0.5
 ! Line 23 : TOWER_VEL_MAX [m/s]
 0.5
-! Line 24 : enable trace files {0: off, 1: on}
+! Line 24 : MPC_DT [s] for internal prediction model
+0.005
+! Line 25 : enable trace files {0: off, 1: on}
 1

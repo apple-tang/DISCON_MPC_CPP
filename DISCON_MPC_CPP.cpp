@@ -154,6 +154,7 @@ namespace
     float gRB = 120.0f;
     int   gNPred = 5;
     int   gNCtrlH = 5;
+    float gPredictionDt = 0.000125f;
     float gOmegaErrMax = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
     float gTowerVelMax = 0.5f;   // m/s
@@ -417,10 +418,11 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
-        // newest format: 24 data lines, line 24 toggles trace-file generation
+        // newest format: 25 data lines, line 24 is MPC_DT and line 25 toggles trace-file generation
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
+        gPredictionDt = 0.000125f;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         gEnableTraceFiles = true;
@@ -469,6 +471,17 @@ namespace
             if (lines.size() > idx) gOmegaErrMax = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerDispMax = std::stof(lines[idx++]);
             if (lines.size() > idx) gTowerVelMax = std::stof(lines[idx++]);
+        }
+
+        if (lines.size() > idx)
+        {
+            gPredictionDt = std::stof(lines[idx++]);
+        }
+
+        if (gPredictionDt <= 0.0f)
+        {
+            err = "MPC_DT must be positive.";
+            return false;
         }
 
         if (lines.size() > idx)
@@ -646,6 +659,7 @@ namespace
         std::ostringstream cfg;
         cfg << "# N_PRED=" << gNPred
             << ", N_CTRL_H=" << gNCtrlH
+            << ", MPC_DT=" << gPredictionDt
             << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
             << ", R=[" << gRT << "," << gRB << "]"
             << ", limits=[omegaErrMax=" << gOmegaErrMax
@@ -1035,7 +1049,7 @@ namespace
 
     inline bool solveMultiStepMPC(
         float time,
-        float dt,
+        float dtController,
         float rotSpeed,
         float horWindV,
         float towerDispFA,
@@ -1049,6 +1063,7 @@ namespace
     {
         const int nPred = gNPred;
         const int nCtrlH = gNCtrlH;
+        const float dtPred = gPredictionDt;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
         gCurrentTerminalIndex = lookupTerminalScheduleIndex(horWindV, rotSpeedRPM);
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
@@ -1056,7 +1071,7 @@ namespace
             [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
         const float dWind = horWindV - windRef;
         bool usedLidarHistory = false;
-        const std::vector<float> dWindPreview = buildWindPreviewDeltas(time, horWindV, nPred, dt, usedLidarHistory);
+        const std::vector<float> dWindPreview = buildWindPreviewDeltas(time, horWindV, nPred, dtPred, usedLidarHistory);
 
         const float gTOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTomega, horWindV, rotSpeedRPM) : G_TOMEGA_DEFAULT;
         const float gTBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTbeta, horWindV, rotSpeedRPM) : G_TBETA_DEFAULT;
@@ -1082,17 +1097,17 @@ namespace
         auto Aat = [&](int r, int c) -> float& { return Abar[r * N_STATE + c]; };
         auto Bat = [&](int r, int c) -> float& { return Bbar[r * N_CTRL + c]; };
 
-        const float a11 = 1.0f + dt * gTOmegaNow / J_EQ;
+        const float a11 = 1.0f + dtPred * gTOmegaNow / J_EQ;
         const float a22 = 1.0f;
-        const float a23 = dt;
-        const float a31 = dt * gFOmegaNow / M_T;
-        const float a32 = -dt * K_T / M_T;
-        const float a33 = 1.0f - dt * C_T / M_T;
-        const float b11 = -dt * N_gear / J_EQ;
-        const float b12 = dt * gTBetaNow / J_EQ;
-        const float b32 = dt * gFBetaNow / M_T;
-        const float e11 = dt * gTUNow / J_EQ;
-        const float e31 = dt * gFUNow / M_T;
+        const float a23 = dtPred;
+        const float a31 = dtPred * gFOmegaNow / M_T;
+        const float a32 = -dtPred * K_T / M_T;
+        const float a33 = 1.0f - dtPred * C_T / M_T;
+        const float b11 = -dtPred * N_gear / J_EQ;
+        const float b12 = dtPred * gTBetaNow / J_EQ;
+        const float b32 = dtPred * gFBetaNow / M_T;
+        const float e11 = dtPred * gTUNow / J_EQ;
+        const float e31 = dtPred * gFUNow / M_T;
 
         Aat(0, 0) = a11;  Aat(0, 3) = b11;  Aat(0, 4) = b12;
         Aat(1, 1) = a22;  Aat(1, 2) = a23;
@@ -1244,16 +1259,16 @@ namespace
         }
 
         // Bounds on input increments
-        const float dTgRate = VS_MAX_TQ_RATE * dt;
-        const float dBetaRate = PC_MAX_RAT * dt;
+        const float dTgRatePred = VS_MAX_TQ_RATE * dtPred;
+        const float dBetaRatePred = PC_MAX_RAT * dtPred;
 
         std::vector<real_t> lb(NU, 0.0), ub(NU, 0.0);
         for (int p = 0; p < nCtrlH; ++p)
         {
-            lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRate);
-            ub[p * N_CTRL + 0] = static_cast<real_t>(dTgRate);
-            lb[p * N_CTRL + 1] = static_cast<real_t>(-dBetaRate);
-            ub[p * N_CTRL + 1] = static_cast<real_t>(dBetaRate);
+            lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRatePred);
+            ub[p * N_CTRL + 0] = static_cast<real_t>(dTgRatePred);
+            lb[p * N_CTRL + 1] = static_cast<real_t>(-dBetaRatePred);
+            ub[p * N_CTRL + 1] = static_cast<real_t>(dBetaRatePred);
         }
 
         // Absolute-input constraints through cumulative-sum matrix Tu
@@ -1365,8 +1380,12 @@ namespace
         const float dTg = static_cast<float>(xOpt[0]);
         const float dBeta = static_cast<float>(xOpt[1]);
 
-        demandedGenTorque = std::clamp(prevGenTorque + dTg, VS_MIN_TQ, VS_MAX_TQ);
-        demandedPitchCmd = std::clamp(prevPitchCmd + dBeta, PC_MIN_PIT, PC_MAX_PIT);
+        const float dTgRateApply = VS_MAX_TQ_RATE * dtController;
+        const float dBetaRateApply = PC_MAX_RAT * dtController;
+        const float dTgApplied = std::clamp(dTg, -dTgRateApply, dTgRateApply);
+        const float dBetaApplied = std::clamp(dBeta, -dBetaRateApply, dBetaRateApply);
+        demandedGenTorque = std::clamp(prevGenTorque + dTgApplied, VS_MIN_TQ, VS_MAX_TQ);
+        demandedPitchCmd = std::clamp(prevPitchCmd + dBetaApplied, PC_MIN_PIT, PC_MAX_PIT);
 
         float Jomega = 0.0f;
         float Jx = 0.0f;
@@ -1434,7 +1453,7 @@ namespace
                 gPredictionLogPath,
                 time,
                 p + 1,
-                time + static_cast<float>(p + 1) * dt,
+                time + static_cast<float>(p + 1) * dtPred,
                 dOmegaPred,
                 xPred,
                 vPred,
@@ -1474,8 +1493,8 @@ namespace
             prevPitchCmd,
             demandedGenTorque,
             demandedPitchCmd,
-            dTg,
-            dBeta,
+            dTgApplied,
+            dBetaApplied,
             xbar0,
             Jtotal,
             Jomega,

@@ -44,16 +44,25 @@ placeholder identified sensitivities and a short fixed prediction horizon.
 The current `.IN` file now externalizes:
 
 - `FractureTime`
+- `N_PRED`
+- `N_CTRL_H`
+- `MPC_DT`
 - `Q_OMEGA`
 - `Q_X`
 - `Q_V`
+- `Q_TG`
+- `Q_BETA`
 - `R_T`
 - `R_B`
 - `OMEGA_ERR_MAX`
 - `TOWER_DISP_MAX`
 - `TOWER_VEL_MAX`
 
-The prediction horizon lengths and model dimensions remain compile-time constants.
+`MPC_DT` is the internal prediction-model discretization step used by the MPC horizon. It does not
+need to match the incoming OpenFAST call interval. The applied generator-torque and pitch moves are
+still re-limited against the physical actuator-rate bounds using the actual controller call interval
+before they are written back to `avrSWAP`, so increasing `MPC_DT` for prediction does not remove
+the final output protection against torque/pitch overshoot.
 
 ## Example build (Visual Studio toolchain)
 
