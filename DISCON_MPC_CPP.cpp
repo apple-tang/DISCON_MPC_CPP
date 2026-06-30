@@ -278,7 +278,27 @@ namespace
         return K;
     }
 
-    inline std::array<float, N_STATE> buildAugmentedState(
+    inline float getRotorSpeedReference(float time, float rotSpeed)
+    {
+        (void)time;
+        (void)rotSpeed;
+        return OMEGA_REF;
+    }
+
+    inline std::array<float, N_STATE> buildReferenceState(float time, float rotSpeed)
+    {
+        (void)time;
+        (void)rotSpeed;
+        return {
+            0.0f,
+            0.0f,
+            0.0f,
+            TG_REF,
+            BETA_REF
+        };
+    }
+
+    inline std::array<float, N_STATE> buildErrorState(
         float time,
         float rotSpeed,
         float towerDispFA,
@@ -286,15 +306,13 @@ namespace
         float prevGenTorque,
         float prevPitchCmd)
     {
-        (void)time;
-        (void)rotSpeed;
-        const float tgRefNow = TG_REF;
+        const auto xRef = buildReferenceState(time, rotSpeed);
         return {
-            rotSpeed - OMEGA_REF,
-            towerDispFA,
-            towerVelFA,
-            prevGenTorque - tgRefNow,
-            prevPitchCmd - BETA_REF
+            rotSpeed - xRef[0],
+            towerDispFA - xRef[1],
+            towerVelFA - xRef[2],
+            prevGenTorque - xRef[3],
+            prevPitchCmd - xRef[4]
         };
     }
 
@@ -311,7 +329,7 @@ namespace
     {
         const float rotSpeedRPM = rotSpeed * RPS2RPM;
         const MatUN K = getScheduledTerminalK(horWindV, rotSpeedRPM);
-        const auto z = buildAugmentedState(time, rotSpeed, towerDispFA, towerVelFA, prevGenTorque, prevPitchCmd);
+        const auto z = buildErrorState(time, rotSpeed, towerDispFA, towerVelFA, prevGenTorque, prevPitchCmd);
 
         float deltaTg = 0.0f;
         float deltaBeta = 0.0f;
@@ -936,7 +954,9 @@ namespace
         const int nCtrlH = gNCtrlH;
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
         gCurrentTerminalIndex = lookupTerminalScheduleIndex(horWindV, rotSpeedRPM);
+        const float omegaRefNow = getRotorSpeedReference(time, rotSpeed);
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
+        const auto xRefNow = buildReferenceState(time, rotSpeed);
         const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
             [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
         const float dWind = horWindV - windRef;
@@ -950,13 +970,13 @@ namespace
         const float gFBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta, horWindV, rotSpeedRPM) : G_FBETA_DEFAULT;
         const float gFUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu, horWindV, rotSpeedRPM) : G_FU_DEFAULT;
 
-        // Augmented state:
-        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref(time, omega), beta - beta_ref ]^T
-        const float x0 = rotSpeed - OMEGA_REF;
+        // Mixed sampled state:
+        // xbar_k = [DeltaOmega_r, x_t, v_t, Tg_{k-1}, beta_{k-1}]^T
+        const float x0 = rotSpeed - omegaRefNow;
         const float x1 = towerDispFA;
         const float x2 = towerVelFA;
-        const float x3 = prevGenTorque - tgRefNow;
-        const float x4 = prevPitchCmd - BETA_REF;
+        const float x3 = prevGenTorque;
+        const float x4 = prevPitchCmd;
 
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
 
@@ -1060,7 +1080,9 @@ namespace
             }
         }
 
-        // c = predicted state stack under zero control increments.
+        // c = predicted mixed-state stack under zero control increments.
+        // In the paper notation, c corresponds to the free prediction term
+        // F xbar_k + T H_k before subtracting the stacked reference X_d.
         // If lidar preview is available, each prediction step uses the
         // corresponding preview disturbance dWindPreview[p]. Otherwise, fall
         // back to the legacy constant-over-horizon disturbance dWind.
@@ -1079,6 +1101,18 @@ namespace
             }
             xpred = xnext;
         }
+
+        std::vector<float> xRefStack(NX, 0.0f);
+        for (int p = 0; p < nPred; ++p)
+        {
+            const int base = p * N_STATE;
+            for (int i = 0; i < N_STATE; ++i)
+                xRefStack[base + i] = xRefNow[static_cast<std::size_t>(i)];
+        }
+
+        std::vector<float> eFree(NX, 0.0f);
+        for (int i = 0; i < NX; ++i)
+            eFree[i] = c[i] - xRefStack[i];
 
         // Block-diagonal Q and R
         std::vector<float> Qblk(NX * NX, 0.0f);
@@ -1123,7 +1157,7 @@ namespace
             {
                 const float qkk = Qblk[k * NX + k];
                 if (qkk != 0.0f)
-                    gv += G[k * NU + i] * qkk * c[k];
+                    gv += G[k * NU + i] * qkk * eFree[k];
             }
             g[i] = static_cast<real_t>(2.0f * gv);
         }
@@ -1163,9 +1197,7 @@ namespace
             ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
         }
 
-        // State constraints on predicted [dOmega, x_t, v_t]
-        // dOmega uses an asymmetric bound:
-        //   OMEGA_MIN <= rotSpeed = dOmega + OMEGA_REF <= gOmegaErrMax + OMEGA_REF
+        // State constraints on predicted [DeltaOmega_r, x_t, v_t].
         const int stateRowBase = NC_INPUT;
         for (int p = 0; p < nPred; ++p)
         {
@@ -1185,9 +1217,9 @@ namespace
                 Acon[(lowRow + 2) * NU + j] = static_cast<real_t>(-G[(xBase + 2) * NU + j]);
             }
 
-            const float cOmega = c[xBase + 0];
-            const float cDisp = c[xBase + 1];
-            const float cVel = c[xBase + 2];
+            const float cOmega = c[xBase + 0] - xRefStack[xBase + 0];
+            const float cDisp = c[xBase + 1] - xRefStack[xBase + 1];
+            const float cVel = c[xBase + 2] - xRefStack[xBase + 2];
 
             ubA[upRow + 0] = static_cast<real_t>(gOmegaErrMax - cOmega);
             ubA[upRow + 1] = static_cast<real_t>(gTowerDispMax - cDisp);
@@ -1226,6 +1258,7 @@ namespace
                 << ", nWSR_used=" << nWSR
                 << ", NU=" << NU
                 << ", NC=" << NC
+                << ", OmegaRef=" << omegaRefNow
                 << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
@@ -1241,6 +1274,7 @@ namespace
                 << qpReturnValueToString(rv)
                 << " (code=" << static_cast<int>(rv)
                 << ", status=" << qpSimpleStatusToString(rv)
+                << ", OmegaRef=" << omegaRefNow
                 << ", TgRef=" << tgRefNow
                 << ")";
             solveErr = oss.str();
@@ -1256,15 +1290,19 @@ namespace
         for (int p = 0; p < nPred; ++p)
         {
             const int xBase = p * N_STATE;
-            float dOmegaPred = c[xBase + 0];
+            float omegaPred = c[xBase + 0];
             float xPred = c[xBase + 1];
             float vPred = c[xBase + 2];
             for (int j = 0; j < NU; ++j)
             {
-                dOmegaPred += G[(xBase + 0) * NU + j] * static_cast<float>(xOpt[j]);
+                omegaPred += G[(xBase + 0) * NU + j] * static_cast<float>(xOpt[j]);
                 xPred += G[(xBase + 1) * NU + j] * static_cast<float>(xOpt[j]);
                 vPred += G[(xBase + 2) * NU + j] * static_cast<float>(xOpt[j]);
             }
+
+            const float dOmegaPred = omegaPred - xRefStack[xBase + 0];
+            const float xPredErr = xPred - xRefStack[xBase + 1];
+            const float vPredErr = vPred - xRefStack[xBase + 2];
 
             appendPredictionLogRow(
                 gPredictionLogPath,
@@ -1272,11 +1310,11 @@ namespace
                 p + 1,
                 time + static_cast<float>(p + 1) * dt,
                 dOmegaPred,
-                xPred,
-                vPred,
+                xPredErr,
+                vPredErr,
                 x0,
-                x1,
-                x2,
+                x1 - xRefNow[1],
+                x2 - xRefNow[2],
                 horWindV
             );
         }
