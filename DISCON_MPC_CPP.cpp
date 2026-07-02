@@ -5,13 +5,13 @@
 #include <deque>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <string>
 #include <sstream>
 #include <vector>
 #include <ctime>
 
 #include <qpOASES.hpp>
-#include "terminal_mpc_schedule.hpp"
 
 #ifdef _WIN32
 #define DLL_EXPORT extern "C" __declspec(dllexport)
@@ -42,6 +42,8 @@ namespace
         float VS_Slope25 = 0.0f;
         float VS_SySp = 0.0f;
         float VS_TrGnSp = 0.0f;
+        bool operatingWindRefInitialized = false;
+        float operatingWindRef = 0.0f;
     };
 
     struct GainTableData
@@ -121,7 +123,7 @@ namespace
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
     // Updated from the user's latest identified values.
-    constexpr float J_RF = 3.19609962e7f;      // kg m^2  (identified rotor-equivalent inertia at 70%)
+    constexpr float J_RF = 2.56488355e7f;      // kg m^2  (identified rotor-equivalent inertia at 70%)
     constexpr float J_generator = 534.116f;    // Generator inertia about HSS (kg m^2)
 
     constexpr float N_gear = 97.0f;            // gearbox ratio
@@ -143,6 +145,7 @@ namespace
     constexpr float LIDAR_MIN_CONV_WIND = 1.0f;   // minimum convection speed used in Taylor mapping [m/s]
     constexpr float LIDAR_EVOLUTION_LENGTH = 300.0f; // decay length for preview confidence [m]
     constexpr float LIDAR_HISTORY_MAX_AGE = 30.0f;   // seconds of lidar history kept for preview mapping
+    constexpr float OPERATING_WIND_REF_TAU = 0.5f;   // low-pass time constant for disturbance reference [s]
 
     // Tunable MPC weights and state-constraint limits.
     float gQOmega = 22.9f;
@@ -167,6 +170,38 @@ namespace
     using MatNU = std::array<float, N_STATE * N_CTRL>;
     using MatUN = std::array<float, N_CTRL * N_STATE>;
     using MatUU = std::array<float, N_CTRL * N_CTRL>;
+
+    struct TerminalScheduleData
+    {
+        bool ready = false;
+        int fallbackPoints = 0;
+        std::vector<float> windPtsMs;
+        std::vector<float> speedPtsRpm;
+        std::vector<MatNN> PTable;
+        std::vector<MatUN> KTable;
+    };
+
+    TerminalScheduleData gTerminal;
+
+    struct SolverWorkspace
+    {
+        int nx = 0;
+        int nu = 0;
+        int nc = 0;
+        std::vector<float> G;
+        std::vector<float> c;
+        std::vector<real_t> H;
+        std::vector<real_t> g;
+        std::vector<real_t> lb;
+        std::vector<real_t> ub;
+        std::vector<real_t> Acon;
+        std::vector<real_t> lbA;
+        std::vector<real_t> ubA;
+        std::vector<real_t> xOpt;
+        std::vector<MatNN> powers;
+    };
+
+    SolverWorkspace gSolverWs;
 
     inline std::string cArrayToString(const char* data, int n)
     {
@@ -236,9 +271,214 @@ namespace
         return R;
     }
 
+    inline bool solveRiccati2x2(const MatUU& S, const MatUN& BtPA, MatUN& K)
+    {
+        MatUU Sinv{};
+        if (!invert2x2(S, Sinv)) return false;
+        for (int r = 0; r < N_CTRL; ++r)
+        {
+            for (int c = 0; c < N_STATE; ++c)
+            {
+                const float val =
+                    Sinv[r * N_CTRL + 0] * BtPA[0 * N_STATE + c] +
+                    Sinv[r * N_CTRL + 1] * BtPA[1 * N_STATE + c];
+                K[r * N_STATE + c] = -val;
+            }
+        }
+        return true;
+    }
+
+    inline bool computeDiscreteLqrTerminal(const MatNN& A, const MatNU& B, MatNN& P, MatUN& K)
+    {
+        const MatNN Q = makeDiagonalQ();
+        const MatUU R = makeDiagonalR();
+        P = Q;
+
+        for (int iter = 0; iter < 500; ++iter)
+        {
+            MatUN BtPA{};
+            MatUU BtPB{};
+            MatNN AtPA{};
+            MatNN AtPBK{};
+            MatUN Knew{};
+            MatNN Pnext{};
+
+            for (int i = 0; i < N_CTRL; ++i)
+            {
+                for (int j = 0; j < N_STATE; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += B[k * N_CTRL + i] * P[k * N_STATE + j];
+                    BtPA[i * N_STATE + j] = acc;
+                }
+            }
+
+            for (int i = 0; i < N_CTRL; ++i)
+            {
+                for (int j = 0; j < N_CTRL; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += BtPA[i * N_STATE + k] * B[k * N_CTRL + j];
+                    BtPB[i * N_CTRL + j] = acc + R[i * N_CTRL + j];
+                }
+            }
+
+            for (int i = 0; i < N_CTRL; ++i)
+            {
+                for (int j = 0; j < N_STATE; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += BtPA[i * N_STATE + k] * A[k * N_STATE + j];
+                    BtPA[i * N_STATE + j] = acc;
+                }
+            }
+
+            if (!solveRiccati2x2(BtPB, BtPA, Knew)) return false;
+
+            for (int i = 0; i < N_STATE; ++i)
+            {
+                for (int j = 0; j < N_STATE; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += A[k * N_STATE + i] * P[k * N_STATE + j];
+                    AtPA[i * N_STATE + j] = acc;
+                }
+            }
+
+            for (int i = 0; i < N_STATE; ++i)
+            {
+                for (int j = 0; j < N_STATE; ++j)
+                {
+                    float accAPA = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        accAPA += AtPA[i * N_STATE + k] * A[k * N_STATE + j];
+
+                    Pnext[i * N_STATE + j] = Q[i * N_STATE + j] + accAPA;
+                }
+            }
+
+            MatNU PB{};
+            MatNU APB{};
+            for (int i = 0; i < N_STATE; ++i)
+            {
+                for (int j = 0; j < N_CTRL; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += P[i * N_STATE + k] * B[k * N_CTRL + j];
+                    PB[i * N_CTRL + j] = acc;
+                }
+            }
+            for (int i = 0; i < N_STATE; ++i)
+            {
+                for (int j = 0; j < N_CTRL; ++j)
+                {
+                    float acc = 0.0f;
+                    for (int k = 0; k < N_STATE; ++k)
+                        acc += A[k * N_STATE + i] * PB[k * N_CTRL + j];
+                    APB[i * N_CTRL + j] = acc;
+                }
+            }
+            for (int i = 0; i < N_STATE; ++i)
+            {
+                for (int j = 0; j < N_STATE; ++j)
+                {
+                    float correction = 0.0f;
+                    for (int m = 0; m < N_CTRL; ++m)
+                        correction += APB[i * N_CTRL + m] * (-Knew[m * N_STATE + j]);
+                    Pnext[i * N_STATE + j] -= correction;
+                }
+            }
+
+            float maxDiff = 0.0f;
+            for (int i = 0; i < N_STATE * N_STATE; ++i)
+                maxDiff = std::max(maxDiff, std::fabs(Pnext[i] - P[i]));
+
+            P = Pnext;
+            K = Knew;
+            if (maxDiff < 1.0e-4f) return true;
+        }
+        return false;
+    }
+
+    inline bool buildRuntimeTerminalSchedule(std::string& err)
+    {
+        gTerminal = {};
+        if (!gTable.loaded)
+        {
+            err = "Gain tables must be loaded before building terminal schedule.";
+            return false;
+        }
+
+        gTerminal.windPtsMs = gTable.windPtsMs;
+        gTerminal.speedPtsRpm = gTable.speedPtsRpm;
+        const std::size_t nWind = gTerminal.windPtsMs.size();
+        const std::size_t nSpeed = gTerminal.speedPtsRpm.size();
+        gTerminal.PTable.resize(nWind * nSpeed);
+        gTerminal.KTable.resize(nWind * nSpeed);
+
+        for (std::size_t iw = 0; iw < nWind; ++iw)
+        {
+            for (std::size_t is = 0; is < nSpeed; ++is)
+            {
+                const float windNow = gTerminal.windPtsMs[iw];
+                const float speedNow = gTerminal.speedPtsRpm[is];
+
+                const float gTOmegaNow = gTable.GTomega[iw][is];
+                const float gTBetaNow = gTable.GTbeta[iw][is];
+                const float gFOmegaNow = gTable.GFomega[iw][is];
+                const float gFBetaNow = gTable.GFbeta[iw][is];
+
+                MatNN A{};
+                MatNU B{};
+                const float dt = gPredictionDt;
+                const float a11 = 1.0f + dt * gTOmegaNow / J_EQ;
+                const float a23 = dt;
+                const float a31 = dt * gFOmegaNow / M_T;
+                const float a32 = -dt * K_T / M_T;
+                const float a33 = 1.0f - dt * C_T / M_T;
+                const float b11 = -dt * N_gear / J_EQ;
+                const float b12 = dt * gTBetaNow / J_EQ;
+                const float b32 = dt * gFBetaNow / M_T;
+
+                A[0 * N_STATE + 0] = a11;  A[0 * N_STATE + 3] = b11;  A[0 * N_STATE + 4] = b12;
+                A[1 * N_STATE + 1] = 1.0f; A[1 * N_STATE + 2] = a23;
+                A[2 * N_STATE + 0] = a31;  A[2 * N_STATE + 1] = a32;  A[2 * N_STATE + 2] = a33; A[2 * N_STATE + 4] = b32;
+                A[3 * N_STATE + 3] = 1.0f;
+                A[4 * N_STATE + 4] = 1.0f;
+
+                B[0 * N_CTRL + 0] = b11;  B[0 * N_CTRL + 1] = b12;
+                B[1 * N_CTRL + 0] = 0.0f; B[1 * N_CTRL + 1] = 0.0f;
+                B[2 * N_CTRL + 0] = 0.0f; B[2 * N_CTRL + 1] = b32;
+                B[3 * N_CTRL + 0] = 1.0f; B[3 * N_CTRL + 1] = 0.0f;
+                B[4 * N_CTRL + 0] = 0.0f; B[4 * N_CTRL + 1] = 1.0f;
+
+                MatNN P{};
+                MatUN K{};
+                if (!computeDiscreteLqrTerminal(A, B, P, K))
+                {
+                    P = makeDiagonalQ();
+                    K = {};
+                    gTerminal.fallbackPoints += 1;
+                }
+
+                const std::size_t idx = iw * nSpeed + is;
+                gTerminal.PTable[idx] = P;
+                gTerminal.KTable[idx] = K;
+            }
+        }
+
+        gTerminal.ready = true;
+        return true;
+    }
+
     inline int lookupTerminalScheduleIndex(float windNow, float speedNowRpm)
     {
-        auto nearestIndex = [](const auto& arr, float x) -> int
+        auto nearestIndex = [](const std::vector<float>& arr, float x) -> int
         {
             int idx = 0;
             float best = std::fabs(arr[0] - x);
@@ -254,30 +494,21 @@ namespace
             return idx;
         };
 
-        const int iw = nearestIndex(kTerminalWindPoints, windNow);
-        const int is = nearestIndex(kTerminalSpeedPoints, speedNowRpm);
-        const int tableIdx = iw * kTerminalNumSpeed + is;
-        return kTerminalPointToIndex[tableIdx];
+        const int iw = nearestIndex(gTerminal.windPtsMs, windNow);
+        const int is = nearestIndex(gTerminal.speedPtsRpm, speedNowRpm);
+        return iw * static_cast<int>(gTerminal.speedPtsRpm.size()) + is;
     }
 
     inline MatNN getScheduledTerminalP(float windNow, float speedNowRpm)
     {
-        MatNN P{};
         const int idx = lookupTerminalScheduleIndex(windNow, speedNowRpm);
-        const int offset = idx * (N_STATE * N_STATE);
-        for (int i = 0; i < N_STATE * N_STATE; ++i)
-            P[i] = kTerminalPTable[static_cast<std::size_t>(offset + i)];
-        return P;
+        return gTerminal.PTable[static_cast<std::size_t>(idx)];
     }
 
     inline MatUN getScheduledTerminalK(float windNow, float speedNowRpm)
     {
-        MatUN K{};
         const int idx = lookupTerminalScheduleIndex(windNow, speedNowRpm);
-        const int offset = idx * (N_CTRL * N_STATE);
-        for (int i = 0; i < N_CTRL * N_STATE; ++i)
-            K[i] = kTerminalKTable[static_cast<std::size_t>(offset + i)];
-        return K;
+        return gTerminal.KTable[static_cast<std::size_t>(idx)];
     }
 
     inline std::array<float, N_STATE> buildAugmentedState(
@@ -498,6 +729,26 @@ namespace
         return std::max(lo, std::min(x, hi));
     }
 
+    inline float updateOperatingWindReference(float currentWind, float dtController)
+    {
+        if (!gState.operatingWindRefInitialized)
+        {
+            gState.operatingWindRef = currentWind;
+            gState.operatingWindRefInitialized = true;
+        }
+        else
+        {
+            const float tau = std::max(OPERATING_WIND_REF_TAU, dtController);
+            const float alpha = std::exp(-dtController / tau);
+            gState.operatingWindRef = alpha * gState.operatingWindRef + (1.0f - alpha) * currentWind;
+        }
+
+        if (gTable.loaded && !gTable.windPtsMs.empty())
+            gState.operatingWindRef = clampToRange(gState.operatingWindRef, gTable.windPtsMs.front(), gTable.windPtsMs.back());
+
+        return gState.operatingWindRef;
+    }
+
     inline void readLidarPreviewData(const float* avrSWAP, LidarPreviewData& lidar)
     {
         lidar = {};
@@ -668,9 +919,11 @@ namespace
         appendDebugLog(path, cfg.str());
 
         std::ostringstream sched;
-        sched << "# terminal_schedule_points=" << kTerminalNumPoints
-              << ", wind_grid=" << kTerminalNumWind
-              << ", speed_grid=" << kTerminalNumSpeed;
+        sched << "# terminal_schedule_points=" << gTerminal.PTable.size()
+              << ", wind_grid=" << gTerminal.windPtsMs.size()
+              << ", speed_grid=" << gTerminal.speedPtsRpm.size()
+              << ", runtime_generated=" << (gTerminal.ready ? 1 : 0)
+              << ", fallback_points=" << gTerminal.fallbackPoints;
         appendDebugLog(path, sched.str());
     }
 
@@ -1067,8 +1320,7 @@ namespace
         const float rotSpeedRPM = rotSpeed * 9.5492966f;
         gCurrentTerminalIndex = lookupTerminalScheduleIndex(horWindV, rotSpeedRPM);
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed);
-        const float windRef = gTable.loaded ? gTable.windPtsMs[std::min_element(gTable.windPtsMs.begin(), gTable.windPtsMs.end(),
-            [&](float a, float b) { return std::fabs(a - horWindV) < std::fabs(b - horWindV); }) - gTable.windPtsMs.begin()] : 11.4f;
+        const float windRef = updateOperatingWindReference(horWindV, dtController);
         const float dWind = horWindV - windRef;
         bool usedLidarHistory = false;
         const std::vector<float> dWindPreview = buildWindPreviewDeltas(time, horWindV, nPred, dtPred, usedLidarHistory);
@@ -1134,8 +1386,48 @@ namespace
         // Build prediction matrices X = F*x0 + G*U
         const int NX = N_STATE * nPred;
         const int NU = N_CTRL * nCtrlH;
-        std::vector<float> F(NX * N_STATE, 0.0f);
-        std::vector<float> G(NX * NU, 0.0f);
+        const int NC_INPUT = 2 * NU;
+        const int NC = NC_INPUT;
+        if (gSolverWs.nx != NX || gSolverWs.nu != NU || gSolverWs.nc != NC)
+        {
+            gSolverWs.nx = NX;
+            gSolverWs.nu = NU;
+            gSolverWs.nc = NC;
+            gSolverWs.G.assign(static_cast<std::size_t>(NX * NU), 0.0f);
+            gSolverWs.c.assign(static_cast<std::size_t>(NX), 0.0f);
+            gSolverWs.H.assign(static_cast<std::size_t>(NU * NU), 0.0);
+            gSolverWs.g.assign(static_cast<std::size_t>(NU), 0.0);
+            gSolverWs.lb.assign(static_cast<std::size_t>(NU), 0.0);
+            gSolverWs.ub.assign(static_cast<std::size_t>(NU), 0.0);
+            gSolverWs.Acon.assign(static_cast<std::size_t>(NC * NU), 0.0);
+            gSolverWs.lbA.assign(static_cast<std::size_t>(NC), BIG_NEG);
+            gSolverWs.ubA.assign(static_cast<std::size_t>(NC), 0.0);
+            gSolverWs.xOpt.assign(static_cast<std::size_t>(NU), 0.0);
+            gSolverWs.powers.resize(static_cast<std::size_t>(nPred));
+        }
+        else
+        {
+            std::fill(gSolverWs.G.begin(), gSolverWs.G.end(), 0.0f);
+            std::fill(gSolverWs.c.begin(), gSolverWs.c.end(), 0.0f);
+            std::fill(gSolverWs.H.begin(), gSolverWs.H.end(), 0.0);
+            std::fill(gSolverWs.g.begin(), gSolverWs.g.end(), 0.0);
+            std::fill(gSolverWs.lb.begin(), gSolverWs.lb.end(), 0.0);
+            std::fill(gSolverWs.ub.begin(), gSolverWs.ub.end(), 0.0);
+            std::fill(gSolverWs.Acon.begin(), gSolverWs.Acon.end(), 0.0);
+            std::fill(gSolverWs.lbA.begin(), gSolverWs.lbA.end(), BIG_NEG);
+            std::fill(gSolverWs.ubA.begin(), gSolverWs.ubA.end(), 0.0);
+        }
+
+        auto& G = gSolverWs.G;
+        auto& c = gSolverWs.c;
+        auto& H = gSolverWs.H;
+        auto& g = gSolverWs.g;
+        auto& lb = gSolverWs.lb;
+        auto& ub = gSolverWs.ub;
+        auto& Acon = gSolverWs.Acon;
+        auto& lbA = gSolverWs.lbA;
+        auto& ubA = gSolverWs.ubA;
+        auto& xOpt = gSolverWs.xOpt;
 
         auto matMulSq = [&](const std::array<float, N_STATE* N_STATE>& M,
             const std::array<float, N_STATE* N_STATE>& N) {
@@ -1159,15 +1451,11 @@ namespace
 
         std::array<float, N_STATE* N_STATE> Apow{};
         for (int i = 0; i < N_STATE; ++i) Apow[i * N_STATE + i] = 1.0f;
-
-        std::vector<std::array<float, N_STATE* N_STATE>> powers(static_cast<std::size_t>(nPred));
+        auto& powers = gSolverWs.powers;
         for (int p = 0; p < nPred; ++p)
         {
             Apow = matMulSq(Abar, Apow);
             powers[p] = Apow;
-            for (int i = 0; i < N_STATE; ++i)
-                for (int j = 0; j < N_STATE; ++j)
-                    F[(p * N_STATE + i) * N_STATE + j] = Apow[i * N_STATE + j];
         }
 
         for (int p = 0; p < nPred; ++p)
@@ -1194,7 +1482,6 @@ namespace
         // If lidar preview is available, each prediction step uses the
         // corresponding preview disturbance dWindPreview[p]. Otherwise, fall
         // back to the legacy constant-over-horizon disturbance dWind.
-        std::vector<float> c(NX, 0.0f);
         std::array<float, N_STATE> xpred = xbar0;
         for (int p = 0; p < nPred; ++p)
         {
@@ -1210,30 +1497,9 @@ namespace
             xpred = xnext;
         }
 
-        // Block-diagonal Q and R
-        std::vector<float> Qblk(NX * NX, 0.0f);
-        std::vector<float> Rblk(NU * NU, 0.0f);
-
         const MatNN stageQ = makeDiagonalQ();
-        for (int p = 0; p < nPred; ++p)
-        {
-            const int base = p * N_STATE;
-            const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
-            for (int i = 0; i < N_STATE; ++i)
-                for (int j = 0; j < N_STATE; ++j)
-                    Qblk[(base + i) * NX + (base + j)] = blockQ[i * N_STATE + j];
-        }
-        for (int p = 0; p < nCtrlH; ++p)
-        {
-            const int base = p * N_CTRL;
-            Rblk[(base + 0) * NU + (base + 0)] = gRT;
-            Rblk[(base + 1) * NU + (base + 1)] = gRB;
-        }
 
         // H = 2*(G'QG + R), g = 2*G'Qc
-        std::vector<real_t> H(NU * NU, 0.0);
-        std::vector<real_t> g(NU, 0.0);
-
         for (int i = 0; i < NU; ++i)
         {
             for (int j = 0; j < NU; ++j)
@@ -1241,17 +1507,24 @@ namespace
                 float val = 0.0f;
                 for (int k = 0; k < NX; ++k)
                 {
-                    const float qkk = Qblk[k * NX + k];
+                    const int p = k / N_STATE;
+                    const int s = k % N_STATE;
+                    const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
+                    const float qkk = blockQ[s * N_STATE + s];
                     if (qkk != 0.0f)
                         val += G[k * NU + i] * qkk * G[k * NU + j];
                 }
-                val += Rblk[i * NU + j];
+                if (i == j)
+                    val += ((i % N_CTRL) == 0) ? gRT : gRB;
                 H[i * NU + j] = static_cast<real_t>(2.0f * val);
             }
             float gv = 0.0f;
             for (int k = 0; k < NX; ++k)
             {
-                const float qkk = Qblk[k * NX + k];
+                const int p = k / N_STATE;
+                const int s = k % N_STATE;
+                const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
+                const float qkk = blockQ[s * N_STATE + s];
                 if (qkk != 0.0f)
                     gv += G[k * NU + i] * qkk * c[k];
             }
@@ -1262,7 +1535,6 @@ namespace
         const float dTgRatePred = VS_MAX_TQ_RATE * dtPred;
         const float dBetaRatePred = PC_MAX_RAT * dtPred;
 
-        std::vector<real_t> lb(NU, 0.0), ub(NU, 0.0);
         for (int p = 0; p < nCtrlH; ++p)
         {
             lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRatePred);
@@ -1272,11 +1544,6 @@ namespace
         }
 
         // Absolute-input constraints through cumulative-sum matrix Tu
-        const int NC_INPUT = 2 * NU;
-        const int NC_STATE = 2 * 3 * nPred; // upper/lower bounds for [dOmega, x_t, v_t]
-        const int NC = NC_INPUT + NC_STATE;
-
-        std::vector<real_t> Acon(NC * NU, 0.0), lbA(NC, BIG_NEG), ubA(NC, 0.0);
         for (int rowBlk = 0; rowBlk < nCtrlH; ++rowBlk)
         {
             for (int colBlk = 0; colBlk <= rowBlk; ++colBlk)
@@ -1291,42 +1558,6 @@ namespace
             ubA[rowBlk * N_CTRL + 1] = static_cast<real_t>(PC_MAX_PIT - prevPitchCmd);
             ubA[(rowBlk + nCtrlH) * N_CTRL + 0] = static_cast<real_t>(prevGenTorque - VS_MIN_TQ);
             ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
-        }
-
-        // State constraints on predicted [dOmega, x_t, v_t]
-        // dOmega uses an asymmetric bound:
-        //   OMEGA_MIN <= rotSpeed = dOmega + OMEGA_REF <= gOmegaErrMax + OMEGA_REF
-        const int stateRowBase = NC_INPUT;
-        for (int p = 0; p < nPred; ++p)
-        {
-            const int xBase = p * N_STATE;
-            const int upRow = stateRowBase + p * 3;
-            const int lowRow = stateRowBase + 3 * nPred + p * 3;
-
-            // Upper-bound rows: G_state * U <= xmax - c_state
-            for (int j = 0; j < NU; ++j)
-            {
-                Acon[(upRow + 0) * NU + j] = static_cast<real_t>(G[(xBase + 0) * NU + j]); // dOmega
-                Acon[(upRow + 1) * NU + j] = static_cast<real_t>(G[(xBase + 1) * NU + j]); // x_t
-                Acon[(upRow + 2) * NU + j] = static_cast<real_t>(G[(xBase + 2) * NU + j]); // v_t
-
-                Acon[(lowRow + 0) * NU + j] = static_cast<real_t>(-G[(xBase + 0) * NU + j]);
-                Acon[(lowRow + 1) * NU + j] = static_cast<real_t>(-G[(xBase + 1) * NU + j]);
-                Acon[(lowRow + 2) * NU + j] = static_cast<real_t>(-G[(xBase + 2) * NU + j]);
-            }
-
-            const float cOmega = c[xBase + 0];
-            const float cDisp = c[xBase + 1];
-            const float cVel = c[xBase + 2];
-
-            ubA[upRow + 0] = static_cast<real_t>(gOmegaErrMax - cOmega);
-            ubA[upRow + 1] = static_cast<real_t>(gTowerDispMax - cDisp);
-            ubA[upRow + 2] = static_cast<real_t>(gTowerVelMax - cVel);
-
-            //ubA[lowRow + 0] = static_cast<real_t>( cOmega - OMEGA_MIN );
-            ubA[lowRow + 0] = static_cast<real_t>(gOmegaErrMax + cOmega);
-            ubA[lowRow + 1] = static_cast<real_t>(gTowerDispMax + cDisp);
-            ubA[lowRow + 2] = static_cast<real_t>(gTowerVelMax + cVel);
         }
 
         // create and solve QP
@@ -1362,7 +1593,6 @@ namespace
             return false;
         }
 
-        std::vector<real_t> xOpt(NU, 0.0);
         rv = qp.getPrimalSolution(xOpt.data());
         if (rv != SUCCESSFUL_RETURN)
         {
@@ -1416,11 +1646,12 @@ namespace
             predMaxAbsXt = std::max(predMaxAbsXt, std::fabs(xPred));
             predMaxAbsVt = std::max(predMaxAbsVt, std::fabs(vPred));
 
-            const float qOmegaStage = Qblk[(xBase + 0) * NX + (xBase + 0)];
-            const float qXStage = Qblk[(xBase + 1) * NX + (xBase + 1)];
-            const float qVStage = Qblk[(xBase + 2) * NX + (xBase + 2)];
-            const float qTgStage = Qblk[(xBase + 3) * NX + (xBase + 3)];
-            const float qBetaStage = Qblk[(xBase + 4) * NX + (xBase + 4)];
+            const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
+            const float qOmegaStage = blockQ[0 * N_STATE + 0];
+            const float qXStage = blockQ[1 * N_STATE + 1];
+            const float qVStage = blockQ[2 * N_STATE + 2];
+            const float qTgStage = blockQ[3 * N_STATE + 3];
+            const float qBetaStage = blockQ[4 * N_STATE + 4];
 
             float tgErrPred = 0.0f;
             float betaErrPred = 0.0f;
@@ -1567,6 +1798,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastLidarLogTime = -1.0f;
         gState.fallbackCount = 0;
         gState.lastStepUsedFallback = false;
+        gState.operatingWindRefInitialized = false;
+        gState.operatingWindRef = 0.0f;
         gLidarHistory.clear();
 
         std::string loadErr;
@@ -1577,20 +1810,25 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
         gTuningTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_tuning_trace.csv");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
+        bool terminalBuilt = false;
+        if (tablesLoaded)
+            terminalBuilt = buildRuntimeTerminalSchedule(loadErr);
         writeDebugLogHeader(gDebugLogPath);
         writePredictionLogHeader(gPredictionLogPath);
         writeInputTraceHeader(gInputTracePath);
         writeTuningTraceHeader(gTuningTracePath);
 
-        if (tablesLoaded)
+        if (tablesLoaded && terminalBuilt)
             initializeBaselineStates(time, genSpeed, bladePitch1);
 
-        *aviFAIL = tablesLoaded ? 1 : -1;
-        if (tablesLoaded)
+        *aviFAIL = (tablesLoaded && terminalBuilt) ? 1 : -1;
+        if (tablesLoaded && terminalBuilt)
         {
             std::ostringstream oss;
             oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
-                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH << ").";
+                << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH
+                << ", MPC_DT=" << gPredictionDt
+                << ", terminalFallbackPts=" << gTerminal.fallbackPoints << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }
         else
@@ -1603,6 +1841,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
 
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
+    updateOperatingWindReference(horWindV, dt);
     updateLidarHistory(time, horWindV, gLidar);
 
     if (!gState.fractureActive && time >= gFractureTime)
@@ -1759,6 +1998,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             std::ostringstream dbg;
             dbg << "time=" << time
                 << ", wind=" << horWindV
+                << ", windRef=" << gState.operatingWindRef
                 << ", rotSpeedRpm=" << rotSpeed * RPS2RPM
                 << ", lidarAvail=" << (gLidar.available ? 1 : 0)
                 << ", lidarPts=" << gLidar.measuredSpeeds.size()
