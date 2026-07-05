@@ -57,12 +57,17 @@ The current `.IN` file now externalizes:
 - `OMEGA_ERR_MAX`
 - `TOWER_DISP_MAX`
 - `TOWER_VEL_MAX`
+- `nWSR`
 
 `MPC_DT` is the internal prediction-model discretization step used by the MPC horizon. It does not
 need to match the incoming OpenFAST call interval. The applied generator-torque and pitch moves are
 still re-limited against the physical actuator-rate bounds using the actual controller call interval
 before they are written back to `avrSWAP`, so increasing `MPC_DT` for prediction does not remove
 the final output protection against torque/pitch overshoot.
+
+`nWSR` is the qpOASES working-set iteration budget used for each online QP solve. Increase it when
+larger `N_CTRL_H` or added state constraints begin to hit `RET_MAX_NWSR_REACHED`, at the cost of
+more online solver work per controller step.
 
 ## Example build (Visual Studio toolchain)
 

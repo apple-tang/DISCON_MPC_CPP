@@ -117,7 +117,8 @@ namespace
     constexpr float VS_RtGnSp = 121.6805f;
     constexpr float VS_RtPwr = 5296610.0f;
     constexpr float OMEGA_REF = 0.0f;          // shutdown target rotor speed
-    constexpr float OMEGA_MIN = -0.2f;         // hard lower bound to avoid reverse rotation
+    constexpr float OMEGA_MIN_RPM = -0.5f;     // predicted rotor-speed lower bound [rpm]
+    constexpr float OMEGA_MIN = OMEGA_MIN_RPM / RPS2RPM; // predicted rotor-speed lower bound [rad/s]
     constexpr float TG_REF = VS_MIN_TQ;        // shutdown target generator torque [N-m]
     constexpr float BETA_REF = PC_MAX_PIT;     // shutdown target collective pitch [rad]
 
@@ -157,6 +158,7 @@ namespace
     float gRB = 120.0f;
     int   gNPred = 5;
     int   gNCtrlH = 5;
+    int   gNWSR = 200;
     float gPredictionDt = 0.000125f;
     float gOmegaErrMax = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
@@ -165,6 +167,7 @@ namespace
     constexpr int   N_STATE = 5;
     constexpr int   N_CTRL = 2;
     constexpr float BIG_NEG = -1.0e20f;
+    constexpr float BIG_POS = 1.0e20f;
 
     using MatNN = std::array<float, N_STATE * N_STATE>;
     using MatNU = std::array<float, N_STATE * N_CTRL>;
@@ -649,10 +652,12 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
-        // newest format: 25 data lines, line 24 is MPC_DT and line 25 toggles trace-file generation
+        // newest format: 26 data lines, line 24 is MPC_DT, line 25 toggles trace-file generation,
+        // and line 26 sets the qpOASES nWSR iteration budget
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
+        gNWSR = 200;
         gPredictionDt = 0.000125f;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
@@ -718,6 +723,17 @@ namespace
         if (lines.size() > idx)
         {
             gEnableTraceFiles = (std::stoi(lines[idx++]) != 0);
+        }
+
+        if (lines.size() > idx)
+        {
+            gNWSR = std::stoi(lines[idx++]);
+        }
+
+        if (gNWSR < 1)
+        {
+            err = "nWSR must be at least 1.";
+            return false;
         }
 
         gTable.loaded = true;
@@ -911,6 +927,7 @@ namespace
         cfg << "# N_PRED=" << gNPred
             << ", N_CTRL_H=" << gNCtrlH
             << ", MPC_DT=" << gPredictionDt
+            << ", nWSR=" << gNWSR
             << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
             << ", R=[" << gRT << "," << gRB << "]"
             << ", limits=[omegaErrMax=" << gOmegaErrMax
@@ -1387,7 +1404,8 @@ namespace
         const int NX = N_STATE * nPred;
         const int NU = N_CTRL * nCtrlH;
         const int NC_INPUT = 2 * NU;
-        const int NC = NC_INPUT;
+        const int NC_STATE = nPred;
+        const int NC = NC_INPUT + NC_STATE;
         if (gSolverWs.nx != NX || gSolverWs.nu != NU || gSolverWs.nc != NC)
         {
             gSolverWs.nx = NX;
@@ -1401,7 +1419,7 @@ namespace
             gSolverWs.ub.assign(static_cast<std::size_t>(NU), 0.0);
             gSolverWs.Acon.assign(static_cast<std::size_t>(NC * NU), 0.0);
             gSolverWs.lbA.assign(static_cast<std::size_t>(NC), BIG_NEG);
-            gSolverWs.ubA.assign(static_cast<std::size_t>(NC), 0.0);
+            gSolverWs.ubA.assign(static_cast<std::size_t>(NC), BIG_POS);
             gSolverWs.xOpt.assign(static_cast<std::size_t>(NU), 0.0);
             gSolverWs.powers.resize(static_cast<std::size_t>(nPred));
         }
@@ -1415,7 +1433,7 @@ namespace
             std::fill(gSolverWs.ub.begin(), gSolverWs.ub.end(), 0.0);
             std::fill(gSolverWs.Acon.begin(), gSolverWs.Acon.end(), 0.0);
             std::fill(gSolverWs.lbA.begin(), gSolverWs.lbA.end(), BIG_NEG);
-            std::fill(gSolverWs.ubA.begin(), gSolverWs.ubA.end(), 0.0);
+            std::fill(gSolverWs.ubA.begin(), gSolverWs.ubA.end(), BIG_POS);
         }
 
         auto& G = gSolverWs.G;
@@ -1560,13 +1578,25 @@ namespace
             ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
         }
 
+        // Predicted rotor-speed lower bound: dOmega_pred >= OMEGA_MIN
+        for (int p = 0; p < nPred; ++p)
+        {
+            const int row = NC_INPUT + p;
+            const int omegaStateIndex = p * N_STATE + 0;
+            for (int j = 0; j < NU; ++j)
+                Acon[row * NU + j] = G[omegaStateIndex * NU + j];
+
+            lbA[row] = static_cast<real_t>(OMEGA_MIN - c[omegaStateIndex]);
+            ubA[row] = static_cast<real_t>(BIG_POS);
+        }
+
         // create and solve QP
         QProblem qp(NU, NC);
         Options options;
         options.printLevel = PL_NONE;
         qp.setOptions(options);
 
-        int_t nWSR = 200;
+        int_t nWSR = static_cast<int_t>(gNWSR);
         returnValue rv = qp.init(
             H.data(),
             g.data(),
@@ -1828,6 +1858,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
                 << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH
                 << ", MPC_DT=" << gPredictionDt
+                << ", nWSR=" << gNWSR
                 << ", terminalFallbackPts=" << gTerminal.fallbackPoints << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }

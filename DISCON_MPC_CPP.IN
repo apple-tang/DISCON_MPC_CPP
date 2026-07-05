@@ -49,3 +49,5 @@ GFu.csv
 0.005
 ! Line 25 : enable trace files {0: off, 1: on}
 1
+! Line 26 : qpOASES nWSR iteration budget
+500
