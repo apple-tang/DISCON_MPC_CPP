@@ -1,12 +1,12 @@
 ! DISCON_MPC_CPP configuration
 ! Line 1  : number of rotor-speed workpoints
-14
+23
 ! Line 2  : number of wind-speed workpoints
-21
+29
 ! Line 3  : rotor-speed points [rpm], ascending
-3.0,4.0,5.0,6.0,7.0,8.0,8.5,9.0,9.5,10.0,10.5,11.0,11.5,12.0
+1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5,8.0,8.5,9.0,9.5,10.0,10.5,11.0,11.5,12.0
 ! Line 4  : wind-speed points [m/s], ascending
-4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24
+2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
 ! Line 5  : GTomega table file
 GTomega.csv
 ! Line 6  : GTbeta table file
@@ -51,3 +51,5 @@ GFu.csv
 1
 ! Line 26 : qpOASES nWSR iteration budget
 500
+! Line 27 : terminal-cost scale {0: no terminal cost, 1: scheduled LQR terminal cost}
+1.0

@@ -160,6 +160,7 @@ namespace
     int   gNCtrlH = 5;
     int   gNWSR = 200;
     float gPredictionDt = 0.000125f;
+    float gTerminalCostScale = 1.0f;
     float gOmegaErrMax = 2.0f;   // rad/s
     float gTowerDispMax = 0.5f;   // m
     float gTowerVelMax = 0.5f;   // m/s
@@ -201,6 +202,7 @@ namespace
         std::vector<real_t> lbA;
         std::vector<real_t> ubA;
         std::vector<real_t> xOpt;
+        std::vector<float> WG;
         std::vector<MatNN> powers;
     };
 
@@ -469,6 +471,18 @@ namespace
                     gTerminal.fallbackPoints += 1;
                 }
 
+                // The Riccati iteration is evaluated in single precision.
+                // Symmetrizing avoids numerical asymmetry in the QP Hessian.
+                for (int r = 0; r < N_STATE; ++r)
+                {
+                    for (int c = r + 1; c < N_STATE; ++c)
+                    {
+                        const float sym = 0.5f * (P[r * N_STATE + c] + P[c * N_STATE + r]);
+                        P[r * N_STATE + c] = sym;
+                        P[c * N_STATE + r] = sym;
+                    }
+                }
+
                 const std::size_t idx = iw * nSpeed + is;
                 gTerminal.PTable[idx] = P;
                 gTerminal.KTable[idx] = K;
@@ -504,8 +518,40 @@ namespace
 
     inline MatNN getScheduledTerminalP(float windNow, float speedNowRpm)
     {
-        const int idx = lookupTerminalScheduleIndex(windNow, speedNowRpm);
-        return gTerminal.PTable[static_cast<std::size_t>(idx)];
+        MatNN P{};
+        if (!gTerminal.ready || gTerminal.windPtsMs.empty() || gTerminal.speedPtsRpm.empty())
+            return makeDiagonalQ();
+
+        windNow = std::clamp(windNow, gTerminal.windPtsMs.front(), gTerminal.windPtsMs.back());
+        speedNowRpm = std::clamp(speedNowRpm, gTerminal.speedPtsRpm.front(), gTerminal.speedPtsRpm.back());
+
+        int iw = 0;
+        while (iw + 1 < static_cast<int>(gTerminal.windPtsMs.size()) && gTerminal.windPtsMs[iw + 1] < windNow) ++iw;
+        int is = 0;
+        while (is + 1 < static_cast<int>(gTerminal.speedPtsRpm.size()) && gTerminal.speedPtsRpm[is + 1] < speedNowRpm) ++is;
+
+        const int iw2 = std::min(iw + 1, static_cast<int>(gTerminal.windPtsMs.size()) - 1);
+        const int is2 = std::min(is + 1, static_cast<int>(gTerminal.speedPtsRpm.size()) - 1);
+        const float w1 = gTerminal.windPtsMs[iw];
+        const float w2 = gTerminal.windPtsMs[iw2];
+        const float s1 = gTerminal.speedPtsRpm[is];
+        const float s2 = gTerminal.speedPtsRpm[is2];
+        const float a = (iw2 == iw || std::fabs(w2 - w1) < 1.0e-8f) ? 0.0f : (windNow - w1) / (w2 - w1);
+        const float b = (is2 == is || std::fabs(s2 - s1) < 1.0e-8f) ? 0.0f : (speedNowRpm - s1) / (s2 - s1);
+
+        const std::size_t nSpeed = gTerminal.speedPtsRpm.size();
+        const MatNN& p11 = gTerminal.PTable[static_cast<std::size_t>(iw) * nSpeed + static_cast<std::size_t>(is)];
+        const MatNN& p21 = gTerminal.PTable[static_cast<std::size_t>(iw2) * nSpeed + static_cast<std::size_t>(is)];
+        const MatNN& p12 = gTerminal.PTable[static_cast<std::size_t>(iw) * nSpeed + static_cast<std::size_t>(is2)];
+        const MatNN& p22 = gTerminal.PTable[static_cast<std::size_t>(iw2) * nSpeed + static_cast<std::size_t>(is2)];
+        for (int i = 0; i < N_STATE * N_STATE; ++i)
+        {
+            P[i] = (1.0f - a) * (1.0f - b) * p11[i]
+                + a * (1.0f - b) * p21[i]
+                + (1.0f - a) * b * p12[i]
+                + a * b * p22[i];
+        }
+        return P;
     }
 
     inline MatUN getScheduledTerminalK(float windNow, float speedNowRpm)
@@ -652,13 +698,14 @@ namespace
         // old format:  19 data lines, horizons fixed at 5/5 in code
         // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
         // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
-        // newest format: 26 data lines, line 24 is MPC_DT, line 25 toggles trace-file generation,
-        // and line 26 sets the qpOASES nWSR iteration budget
+        // newest format: 27 data lines, line 24 is MPC_DT, line 25 toggles trace-file generation,
+        // line 26 sets the qpOASES nWSR iteration budget, and line 27 scales the terminal cost
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
         gNWSR = 200;
         gPredictionDt = 0.000125f;
+        gTerminalCostScale = 1.0f;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         gEnableTraceFiles = true;
@@ -733,6 +780,16 @@ namespace
         if (gNWSR < 1)
         {
             err = "nWSR must be at least 1.";
+            return false;
+        }
+
+        if (lines.size() > idx)
+        {
+            gTerminalCostScale = std::stof(lines[idx++]);
+        }
+        if (gTerminalCostScale < 0.0f)
+        {
+            err = "TERMINAL_COST_SCALE must be nonnegative.";
             return false;
         }
 
@@ -928,6 +985,7 @@ namespace
             << ", N_CTRL_H=" << gNCtrlH
             << ", MPC_DT=" << gPredictionDt
             << ", nWSR=" << gNWSR
+            << ", terminal_cost_scale=" << gTerminalCostScale
             << ", Q=[" << gQOmega << "," << gQX << "," << gQV << "," << gQTg << "," << gQBeta << "]"
             << ", R=[" << gRT << "," << gRB << "]"
             << ", limits=[omegaErrMax=" << gOmegaErrMax
@@ -1396,7 +1454,8 @@ namespace
         Ebar[3] = 0.0f;
         Ebar[4] = 0.0f;
 
-        const MatNN terminalP = getScheduledTerminalP(horWindV, rotSpeedRPM);
+        MatNN terminalP = getScheduledTerminalP(horWindV, rotSpeedRPM);
+        for (float& value : terminalP) value *= gTerminalCostScale;
         const MatUN terminalK = getScheduledTerminalK(horWindV, rotSpeedRPM);
         (void)terminalK;
 
@@ -1421,6 +1480,7 @@ namespace
             gSolverWs.lbA.assign(static_cast<std::size_t>(NC), BIG_NEG);
             gSolverWs.ubA.assign(static_cast<std::size_t>(NC), BIG_POS);
             gSolverWs.xOpt.assign(static_cast<std::size_t>(NU), 0.0);
+            gSolverWs.WG.assign(static_cast<std::size_t>(N_STATE * NU), 0.0f);
             gSolverWs.powers.resize(static_cast<std::size_t>(nPred));
         }
         else
@@ -1446,6 +1506,7 @@ namespace
         auto& lbA = gSolverWs.lbA;
         auto& ubA = gSolverWs.ubA;
         auto& xOpt = gSolverWs.xOpt;
+        auto& WG = gSolverWs.WG;
 
         auto matMulSq = [&](const std::array<float, N_STATE* N_STATE>& M,
             const std::array<float, N_STATE* N_STATE>& N) {
@@ -1515,39 +1576,43 @@ namespace
             xpred = xnext;
         }
 
-        const MatNN stageQ = makeDiagonalQ();
+        MatNN stageQ = makeDiagonalQ();
 
-        // H = 2*(G'QG + R), g = 2*G'Qc
-        for (int i = 0; i < NU; ++i)
+        // H = 2*(G'Qbar*G + Rbar), g = 2*G'Qbar*c. The terminal
+        // block is the full scheduled Riccati matrix, not just its diagonal.
+        for (int p = 0; p < nPred; ++p)
         {
-            for (int j = 0; j < NU; ++j)
+            const int base = p * N_STATE;
+            const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
+            std::array<float, N_STATE> Qc{};
+            std::fill(WG.begin(), WG.end(), 0.0f);
+
+            for (int r = 0; r < N_STATE; ++r)
             {
-                float val = 0.0f;
-                for (int k = 0; k < NX; ++k)
+                for (int s = 0; s < N_STATE; ++s)
                 {
-                    const int p = k / N_STATE;
-                    const int s = k % N_STATE;
-                    const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
-                    const float qkk = blockQ[s * N_STATE + s];
-                    if (qkk != 0.0f)
-                        val += G[k * NU + i] * qkk * G[k * NU + j];
+                    const float qrs = blockQ[r * N_STATE + s];
+                    Qc[r] += qrs * c[base + s];
+                    for (int j = 0; j < NU; ++j)
+                        WG[r * NU + j] += qrs * G[(base + s) * NU + j];
                 }
-                if (i == j)
-                    val += ((i % N_CTRL) == 0) ? gRT : gRB;
-                H[i * NU + j] = static_cast<real_t>(2.0f * val);
             }
-            float gv = 0.0f;
-            for (int k = 0; k < NX; ++k)
+
+            for (int i = 0; i < NU; ++i)
             {
-                const int p = k / N_STATE;
-                const int s = k % N_STATE;
-                const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
-                const float qkk = blockQ[s * N_STATE + s];
-                if (qkk != 0.0f)
-                    gv += G[k * NU + i] * qkk * c[k];
+                float linearTerm = 0.0f;
+                for (int r = 0; r < N_STATE; ++r)
+                {
+                    const float gri = G[(base + r) * NU + i];
+                    linearTerm += gri * Qc[r];
+                    for (int j = 0; j < NU; ++j)
+                        H[i * NU + j] += static_cast<real_t>(2.0f * gri * WG[r * NU + j]);
+                }
+                g[i] += static_cast<real_t>(2.0f * linearTerm);
             }
-            g[i] = static_cast<real_t>(2.0f * gv);
         }
+        for (int i = 0; i < NU; ++i)
+            H[i * NU + i] += static_cast<real_t>(2.0f * (((i % N_CTRL) == 0) ? gRT : gRB));
 
         // Bounds on input increments
         const float dTgRatePred = VS_MAX_TQ_RATE * dtPred;
@@ -1578,7 +1643,7 @@ namespace
             ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
         }
 
-        // Predicted rotor-speed lower bound: dOmega_pred >= OMEGA_MIN
+        // Predicted rotor-speed lower bound.
         for (int p = 0; p < nPred; ++p)
         {
             const int row = NC_INPUT + p;
@@ -1676,13 +1741,6 @@ namespace
             predMaxAbsXt = std::max(predMaxAbsXt, std::fabs(xPred));
             predMaxAbsVt = std::max(predMaxAbsVt, std::fabs(vPred));
 
-            const MatNN& blockQ = (p == nPred - 1) ? terminalP : stageQ;
-            const float qOmegaStage = blockQ[0 * N_STATE + 0];
-            const float qXStage = blockQ[1 * N_STATE + 1];
-            const float qVStage = blockQ[2 * N_STATE + 2];
-            const float qTgStage = blockQ[3 * N_STATE + 3];
-            const float qBetaStage = blockQ[4 * N_STATE + 4];
-
             float tgErrPred = 0.0f;
             float betaErrPred = 0.0f;
             for (int j = 0; j < NU; ++j)
@@ -1695,19 +1753,20 @@ namespace
 
             if (p == nPred - 1)
             {
-                Jterminal += qOmegaStage * dOmegaPred * dOmegaPred;
-                Jterminal += qXStage * xPred * xPred;
-                Jterminal += qVStage * vPred * vPred;
-                Jterminal += qTgStage * tgErrPred * tgErrPred;
-                Jterminal += qBetaStage * betaErrPred * betaErrPred;
+                const std::array<float, N_STATE> xTerminal = {
+                    dOmegaPred, xPred, vPred, tgErrPred, betaErrPred
+                };
+                for (int r = 0; r < N_STATE; ++r)
+                    for (int s = 0; s < N_STATE; ++s)
+                        Jterminal += xTerminal[r] * terminalP[r * N_STATE + s] * xTerminal[s];
             }
             else
             {
-                Jomega += qOmegaStage * dOmegaPred * dOmegaPred;
-                Jx += qXStage * xPred * xPred;
-                Jv += qVStage * vPred * vPred;
-                Jtg += qTgStage * tgErrPred * tgErrPred;
-                Jbeta += qBetaStage * betaErrPred * betaErrPred;
+                Jomega += gQOmega * dOmegaPred * dOmegaPred;
+                Jx += gQX * xPred * xPred;
+                Jv += gQV * vPred * vPred;
+                Jtg += gQTg * tgErrPred * tgErrPred;
+                Jbeta += gQBeta * betaErrPred * betaErrPred;
             }
 
             appendPredictionLogRow(
@@ -1859,6 +1918,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH
                 << ", MPC_DT=" << gPredictionDt
                 << ", nWSR=" << gNWSR
+                << ", terminalScale=" << gTerminalCostScale
                 << ", terminalFallbackPts=" << gTerminal.fallbackPoints << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }
