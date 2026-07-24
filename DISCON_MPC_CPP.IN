@@ -21,35 +21,31 @@ GFbeta.csv
 GFu.csv
 ! Line 11 : fracture switch time [s]
 30.0
-! Line 12 : N_PRED
-200
-! Line 13 : N_CTRL_H
-5
-! Line 14 : Q_OMEGA
-22.9
-! Line 15 : Q_X
-40.0
-! Line 16 : Q_V
-80.0
-! Line 17 : Q_TG
+! Line 12 : TERMINAL_UNLOAD_OMEGA_RPM [rpm]
+0.2
+! Line 13 : N_PRED
+330
+! Line 14 : N_CTRL_H
+70
+! Line 15 : Q_OMEGA
+30.0
+! Line 16 : Q_X
+200.0
+! Line 17 : Q_V
+200.0
+! Line 18 : Q_TG
 1.0e-6
-! Line 18 : Q_BETA
-10.0
-! Line 19 : R_T
-1.0e-9
-! Line 20 : R_B
-120.0
-! Line 21 : OMEGA_ERR_MAX [rad/s]
-2.0
-! Line 22 : TOWER_DISP_MAX [m]
-0.5
-! Line 23 : TOWER_VEL_MAX [m/s]
-0.5
-! Line 24 : MPC_DT [s] for internal prediction model
-0.005
-! Line 25 : enable trace files {0: off, 1: on}
-1
-! Line 26 : qpOASES nWSR iteration budget
+! Line 19 : Q_BETA
+400.0
+! Line 20 : R_T
+5.0
+! Line 21 : R_B
+60.0
+! Line 22 : MPC_DT [s] for internal prediction model
+0.015
+! Line 23 : enable trace files {0: off, 1: on}
+0
+! Line 24 : qpOASES nWSR iteration budget
 500
-! Line 27 : terminal-cost scale {0: no terminal cost, 1: scheduled LQR terminal cost}
-1.0
+! Line 25 : terminal-cost scale {0: no terminal cost, 1: scheduled LQR terminal cost}
+0.0
