@@ -27,7 +27,6 @@ namespace
     {
         bool initialized = false;
         bool fractureActive = false;
-        bool terminalUnloadLatched = false;
         float lastTime = 0.0f;
         float lastGenTorque = 0.0f;
         float pitchCmd = 0.0f;
@@ -153,11 +152,11 @@ namespace
 
     // Continuous-time physical parameters for the simplified shutdown MPC model.
     // Updated from the user's latest identified values.
-    constexpr float J_RF = 2.56488355e7f;      // kg m^2  (identified rotor-equivalent inertia at 70%)
+    constexpr float J_RF_DEFAULT = 2.56488355e7f; // kg m^2, fallback until OpenFAST publishes fracture inertia
     constexpr float J_generator = 534.116f;    // Generator inertia about HSS (kg m^2)
 
     constexpr float N_gear = 97.0f;            // gearbox ratio
-    constexpr float J_EQ = J_RF + J_generator * N_gear * N_gear; // 等效转动惯量
+    constexpr float J_EQ_DEFAULT = J_RF_DEFAULT + J_generator * N_gear * N_gear; // 等效转动惯量 fallback
     constexpr float M_T = 3.822772e5f;        // kg
     constexpr float C_T = 6.858330e3f;        // N s/m
     constexpr float K_T = 1.184008e6f;        // N/m
@@ -169,6 +168,11 @@ namespace
     constexpr float G_FBETA_DEFAULT = 4.133385e4f;
     constexpr float G_TU_DEFAULT = 3.5e5f;
     constexpr float G_FU_DEFAULT = 2.0e4f;
+    constexpr int   FRACTURE_J_RF_IDX = 1022;           // C index for avrSWAP(1023)
+    constexpr int   FRACTURE_MASS_IMBALANCE_IDX = 1023; // C index for avrSWAP(1024)
+    constexpr int   FRACTURE_LOCATION_IDX = 1024;       // C index for avrSWAP(1025)
+    constexpr int   FRACTURE_SIGMA_IDX = 1025;          // C index for avrSWAP(1026)
+    constexpr int   FRACTURE_STATUS_IDX = 1026;         // C index for avrSWAP(1027): 0 inactive, 1 ramping, 2 final
     constexpr int   LIDAR_MSR_START = 2000;  // C index for avrSWAP(2001)
     constexpr int   LIDAR_MAX_CHAN  = 500;
     constexpr float LIDAR_LOG_DT = 0.1f;     // seconds between lidar debug log entries
@@ -187,6 +191,14 @@ namespace
     constexpr float TURB_OU_BAND2 = 1.50f;           // 14/16 m/s
     constexpr float TURB_OU_BAND3 = 0.20f;           // 18/20 m/s
     constexpr float TURB_OU_BAND4 = 2.00f;           // 22/24 m/s
+
+    float gJRFRuntime = J_RF_DEFAULT;
+    float gJEQRuntime = J_EQ_DEFAULT;
+    float gFractureMassImbalance = 0.0f;
+    float gFractureLocationRR = 0.0f;
+    float gFractureSigma = 1.0f;
+    int gFractureStatusFromFAST = 0;
+    bool gFractureInertiaLocked = false;
 
     // Tunable MPC weights and state-constraint limits.
     float gQOmega = 22.9f;
@@ -483,13 +495,13 @@ namespace
                 MatNN A{};
                 MatNU B{};
                 const float dt = gPredictionDt;
-                const float a11 = 1.0f + dt * gTOmegaNow / J_EQ;
+                const float a11 = 1.0f + dt * gTOmegaNow / gJEQRuntime;
                 const float a23 = dt;
                 const float a31 = dt * gFOmegaNow / M_T;
                 const float a32 = -dt * K_T / M_T;
                 const float a33 = 1.0f - dt * C_T / M_T;
-                const float b11 = -dt * N_gear / J_EQ;
-                const float b12 = dt * gTBetaNow / J_EQ;
+                const float b11 = -dt * N_gear / gJEQRuntime;
+                const float b12 = dt * gTBetaNow / gJEQRuntime;
                 const float b32 = dt * gFBetaNow / M_T;
 
                 A[0 * N_STATE + 0] = a11;  A[0 * N_STATE + 3] = b11;  A[0 * N_STATE + 4] = b12;
@@ -621,6 +633,39 @@ namespace
             prevGenTorque - tgRefNow,
             prevPitchCmd - betaRefNow
         };
+    }
+
+    inline bool updateRuntimeFractureMetricsFromFAST(const float* avrSWAP)
+    {
+        const float jRfFromFAST = avrSWAP[FRACTURE_J_RF_IDX];
+        const int statusFromFAST = static_cast<int>(std::lround(avrSWAP[FRACTURE_STATUS_IDX]));
+
+        gFractureStatusFromFAST = statusFromFAST;
+        gFractureMassImbalance = avrSWAP[FRACTURE_MASS_IMBALANCE_IDX];
+        gFractureLocationRR = avrSWAP[FRACTURE_LOCATION_IDX];
+        gFractureSigma = avrSWAP[FRACTURE_SIGMA_IDX];
+
+        const bool hasValidInertia = std::isfinite(jRfFromFAST) && jRfFromFAST > 1.0e5f;
+        if (statusFromFAST <= 0 || !hasValidInertia)
+            return false;
+
+        if (!gFractureInertiaLocked)
+        {
+            const float inertiaTol = std::max(1.0f, std::fabs(gJRFRuntime) * 1.0e-5f);
+            if (std::fabs(jRfFromFAST - gJRFRuntime) > inertiaTol)
+            {
+                gJRFRuntime = jRfFromFAST;
+                gJEQRuntime = gJRFRuntime + J_generator * N_gear * N_gear;
+            }
+
+            if (statusFromFAST >= 2)
+            {
+                gFractureInertiaLocked = true;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     inline void applyScheduledTerminalFallback(
@@ -849,10 +894,9 @@ namespace
         if (!loadReferenceCurveTable(makePath("TgRefCurveTable_runtime.csv")))
             loadReferenceCurveTable(makePath("TgRefCurveTable.csv"));
 
-        // Endpoint-tracking mode: do not load a time-varying shutdown trajectory.
-        // Rotor speed and pitch use the terminal targets directly, while
-        // generator torque continues to use the static wind-region reference
-        // until terminal-unload mode latches near zero speed.
+        // The paper-study path keeps fixed post-fracture references.
+        // Time-varying shutdown trajectories remain disabled unless they are
+        // explicitly re-enabled in code.
         gShutdownRef = {};
 
         if (lines.size() >= 11) gFractureTime = std::stof(lines[10]);
@@ -1271,6 +1315,8 @@ namespace
         if (!out) return;
         out << "time,iStatus,fracture_active,rotSpeed,horWindV,"
                "avr_1019_towerVelFA,avr_1020_towerVelSS,avr_1021_towerDispFA,"
+               "avr_1023_J_RF,avr_1024_mass_imbalance,avr_1025_frac_r_R,avr_1026_sigma,avr_1027_status,"
+               "runtime_J_RF,runtime_J_EQ,"
                "out_rotSpeed_rads,out_towerVelFA,out_towerDispFA\n";
     }
 
@@ -1284,6 +1330,11 @@ namespace
         float avrTowerVelFA,
         float avrTowerVelSS,
         float avrTowerDispFA,
+        float avrJRF,
+        float avrMassImbalance,
+        float avrFractureLocation,
+        float avrFractureSigma,
+        int avrFractureStatus,
         float towerVelFA,
         float towerDispFA)
     {
@@ -1301,6 +1352,13 @@ namespace
             << avrTowerVelFA << ','
             << avrTowerVelSS << ','
             << avrTowerDispFA << ','
+            << avrJRF << ','
+            << avrMassImbalance << ','
+            << avrFractureLocation << ','
+            << avrFractureSigma << ','
+            << avrFractureStatus << ','
+            << gJRFRuntime << ','
+            << gJEQRuntime << ','
             << rotSpeed << ','
             << towerVelFA << ','
             << towerDispFA << '\n';
@@ -1583,6 +1641,7 @@ namespace
             const float tau = getShutdownRefTime(time);
             return interp1dClamped(gShutdownRef.timeS, gShutdownRef.tgRefKnm, tau) * 1000.0f;
         }
+        // Current paper-aligned path uses the fixed generator-torque reference.
         (void)time;
         (void)rotSpeed;
         (void)windNow;
@@ -1717,16 +1776,16 @@ namespace
         auto Aat = [&](int r, int c) -> float& { return Abar[r * N_STATE + c]; };
         auto Bat = [&](int r, int c) -> float& { return Bbar[r * N_CTRL + c]; };
 
-        const float a11 = 1.0f + dtPred * gTOmegaNow / J_EQ;
+        const float a11 = 1.0f + dtPred * gTOmegaNow / gJEQRuntime;
         const float a22 = 1.0f;
         const float a23 = dtPred;
         const float a31 = dtPred * gFOmegaNow / M_T;
         const float a32 = -dtPred * K_T / M_T;
         const float a33 = 1.0f - dtPred * C_T / M_T;
-        const float b11 = -dtPred * N_gear / J_EQ;
-        const float b12 = dtPred * gTBetaNow / J_EQ;
+        const float b11 = -dtPred * N_gear / gJEQRuntime;
+        const float b12 = dtPred * gTBetaNow / gJEQRuntime;
         const float b32 = dtPred * gFBetaNow / M_T;
-        const float e11 = dtPred * gTUNow / J_EQ;
+        const float e11 = dtPred * gTUNow / gJEQRuntime;
         const float e31 = dtPred * gFUNow / M_T;
 
         Aat(0, 0) = a11;  Aat(0, 3) = b11;  Aat(0, 4) = b12;
@@ -2187,7 +2246,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     {
         gState.initialized = true;
         gState.fractureActive = false;
-        gState.terminalUnloadLatched = false;
         gState.lastTime = time;
         gState.lastGenTorque = 0.0f;
         gState.pitchCmd = bladePitch1;
@@ -2200,6 +2258,13 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.operatingWindRefInitialized = false;
         gState.operatingWindRef = 0.0f;
         gState.turbulentWindBand = -1;
+        gJRFRuntime = J_RF_DEFAULT;
+        gJEQRuntime = J_EQ_DEFAULT;
+        gFractureMassImbalance = 0.0f;
+        gFractureLocationRR = 0.0f;
+        gFractureSigma = 1.0f;
+        gFractureStatusFromFAST = 0;
+        gFractureInertiaLocked = false;
         gLidarHistory.clear();
 
         std::string loadErr;
@@ -2242,6 +2307,23 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         writeMessage(avcMSG, msgLen, "");
     }
 
+    const bool fractureInertiaFinalized = updateRuntimeFractureMetricsFromFAST(avrSWAP);
+    if (fractureInertiaFinalized && gTable.loaded)
+    {
+        std::string terminalErr;
+        if (!buildRuntimeTerminalSchedule(terminalErr))
+        {
+            appendDebugLog(gDebugLogPath, "terminal schedule rebuild failed after fracture inertia lock: " + terminalErr);
+        }
+        else
+        {
+            appendDebugLog(gDebugLogPath, "locked fracture inertia: J_RF=" + std::to_string(gJRFRuntime) +
+                                       ", J_EQ=" + std::to_string(gJEQRuntime) +
+                                       ", mass_imbalance=" + std::to_string(gFractureMassImbalance) +
+                                       ", fracture_r_R=" + std::to_string(gFractureLocationRR));
+        }
+    }
+
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
     updateOperatingWindReference(horWindV, dt);
     updateLidarHistory(time, horWindV, gLidar);
@@ -2261,79 +2343,17 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         avrSWAP[1018],
         avrSWAP[1019],
         avrSWAP[1020],
+        avrSWAP[FRACTURE_J_RF_IDX],
+        avrSWAP[FRACTURE_MASS_IMBALANCE_IDX],
+        avrSWAP[FRACTURE_LOCATION_IDX],
+        avrSWAP[FRACTURE_SIGMA_IDX],
+        gFractureStatusFromFAST,
         towerVelFA,
         towerDispFA
     );
 
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
-
-    auto applyTerminalUnloadMode = [&](float currentTime, float currentDt)
-    {
-        demandedGenTorque = std::clamp(
-            gState.lastGenTorque - VS_MAX_TQ_RATE * currentDt,
-            VS_MIN_TQ,
-            VS_MAX_TQ
-        );
-        demandedPitch = std::clamp(
-            gState.pitchCmd + PC_MAX_RAT * currentDt,
-            PC_MIN_PIT,
-            PC_MAX_PIT
-        );
-        gState.lastStepUsedFallback = false;
-        *aviFAIL = 0;
-        writeMessage(avcMSG, msgLen, "terminal unload latched");
-
-        const float tgRefNow = getGeneratorTorqueReference(currentTime, rotSpeed, gState.operatingWindRef);
-        const float betaRefNow = getPitchReference(currentTime);
-        const std::array<float, N_STATE> z = buildAugmentedState(
-            currentTime, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, gState.lastGenTorque, gState.pitchCmd
-        );
-        appendTuningTraceRow(
-            gTuningTracePath,
-            currentTime,
-            gState.fractureActive,
-            false,
-            false,
-            gState.fallbackCount,
-            gCurrentTerminalIndex,
-            rotSpeed * RPS2RPM,
-            rotSpeed,
-            towerDispFA,
-            towerVelFA,
-            horWindV,
-            0.0f,
-            tgRefNow,
-            betaRefNow,
-            gState.lastGenTorque,
-            gState.pitchCmd,
-            demandedGenTorque,
-            demandedPitch,
-            demandedGenTorque - gState.lastGenTorque,
-            demandedPitch - gState.pitchCmd,
-            z,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-            gQOmega,
-            gQX,
-            gQV,
-            gQTg,
-            gQBeta,
-            gRT,
-            gRB,
-            0.0f,
-            0.0f,
-            0.0f,
-            "terminal_unload"
-        );
-    };
 
     if (!gState.fractureActive)
     {
@@ -2349,105 +2369,93 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
-        const float rotSpeedRpm = rotSpeed * RPS2RPM;
-        const float activeTerminalUnloadTriggerRpm = getScheduledTerminalUnloadTriggerRpm(gState.operatingWindRef);
-        if (!gState.terminalUnloadLatched && rotSpeedRpm <= activeTerminalUnloadTriggerRpm)
-            gState.terminalUnloadLatched = true;
+        std::string qpErr;
+        const bool qpSolved = solveMultiStepMPC(
+            time,
+            dt,
+            rotSpeed,
+            horWindV,
+            towerDispFA,
+            towerVelFA,
+            gLidar,
+            gState.lastGenTorque,
+            gState.pitchCmd,
+            qpErr,
+            demandedGenTorque,
+            demandedPitch
+        );
 
-        if (gState.terminalUnloadLatched)
+        if (!qpSolved)
         {
-            applyTerminalUnloadMode(time, dt);
-        }
-        else
-        {
-            std::string qpErr;
-            const bool qpSolved = solveMultiStepMPC(
+            applyScheduledTerminalFallback(
                 time,
-                dt,
+                gState.operatingWindRef,
                 rotSpeed,
-                horWindV,
                 towerDispFA,
                 towerVelFA,
-                gLidar,
                 gState.lastGenTorque,
                 gState.pitchCmd,
-                qpErr,
                 demandedGenTorque,
                 demandedPitch
             );
+            gState.lastStepUsedFallback = true;
+            gState.fallbackCount += 1;
+            *aviFAIL = 1;
+            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
 
-            if (!qpSolved)
-            {
-                applyScheduledTerminalFallback(
-                    time,
-                    gState.operatingWindRef,
-                    rotSpeed,
-                    towerDispFA,
-                    towerVelFA,
-                    gState.lastGenTorque,
-                    gState.pitchCmd,
-                    demandedGenTorque,
-                    demandedPitch
-                );
-                gState.lastStepUsedFallback = true;
-                gState.fallbackCount += 1;
-                *aviFAIL = 1;
-                writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
-
-                const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
-                const float betaRefNow = getPitchReference(time);
-                const std::array<float, N_STATE> z = buildAugmentedState(
-                    time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, gState.lastGenTorque, gState.pitchCmd
-                );
-                appendTuningTraceRow(
-                    gTuningTracePath,
-                    time,
-                    gState.fractureActive,
-                    false,
-                    true,
-                    gState.fallbackCount,
-                    gCurrentTerminalIndex,
-                    rotSpeed * RPS2RPM,
-                    rotSpeed,
-                    towerDispFA,
-                    towerVelFA,
-                    horWindV,
-                    0.0f,
-                    tgRefNow,
-                    betaRefNow,
-                    gState.lastGenTorque,
-                    gState.pitchCmd,
-                    demandedGenTorque,
-                    demandedPitch,
-                    demandedGenTorque - gState.lastGenTorque,
-                    demandedPitch - gState.pitchCmd,
-                    z,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    gQOmega,
-                    gQX,
-                    gQV,
-                    gQTg,
-                    gQBeta,
-                    gRT,
-                    gRB,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    "fallback"
-                );
-            }
-            else
-            {
-                gState.lastStepUsedFallback = false;
-            }
+            const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
+            const float betaRefNow = getPitchReference(time);
+            const std::array<float, N_STATE> z = buildAugmentedState(
+                time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, gState.lastGenTorque, gState.pitchCmd
+            );
+            appendTuningTraceRow(
+                gTuningTracePath,
+                time,
+                gState.fractureActive,
+                false,
+                true,
+                gState.fallbackCount,
+                gCurrentTerminalIndex,
+                rotSpeed * RPS2RPM,
+                rotSpeed,
+                towerDispFA,
+                towerVelFA,
+                horWindV,
+                0.0f,
+                tgRefNow,
+                betaRefNow,
+                gState.lastGenTorque,
+                gState.pitchCmd,
+                demandedGenTorque,
+                demandedPitch,
+                demandedGenTorque - gState.lastGenTorque,
+                demandedPitch - gState.pitchCmd,
+                z,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                gQOmega,
+                gQX,
+                gQV,
+                gQTg,
+                gQBeta,
+                gRT,
+                gRB,
+                0.0f,
+                0.0f,
+                0.0f,
+                "fallback"
+            );
+        }
+        else
+        {
+            gState.lastStepUsedFallback = false;
         }
     }
 
@@ -2490,6 +2498,12 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 << ", terminalIdx=" << gCurrentTerminalIndex
                 << ", fallbackUsed=" << (gState.lastStepUsedFallback ? 1 : 0)
                 << ", fallbackCount=" << gState.fallbackCount
+                << ", fractureStatusFAST=" << gFractureStatusFromFAST
+                << ", J_RF=" << gJRFRuntime
+                << ", J_EQ=" << gJEQRuntime
+                << ", massImbalance=" << gFractureMassImbalance
+                << ", fracture_r_R=" << gFractureLocationRR
+                << ", fractureSigma=" << gFractureSigma
                 << ", Tg=" << demandedGenTorque
                 << ", betaDeg=" << demandedPitch * R2D;
             appendDebugLog(gDebugLogPath, dbg.str());
