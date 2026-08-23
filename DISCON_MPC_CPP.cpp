@@ -882,7 +882,7 @@ namespace
         std::string dir = inFilePath;
         const auto pos = dir.find_last_of("\\/");
         dir = (pos == std::string::npos) ? "." : dir.substr(0, pos);
-        auto makePath = [&](const std::string& file) { return dir + "\\" + trim(file); };
+        auto makePath = [&](const std::string& file) { return dir + "/" + trim(file); };
 
         if (!loadCsvTable(makePath(lines[4]), nWind, nSpeed, gTable.GTomega)) { err = "Failed loading GTomega table."; return false; }
         if (!loadCsvTable(makePath(lines[5]), nWind, nSpeed, gTable.GTbeta)) { err = "Failed loading GTbeta table.";  return false; }
