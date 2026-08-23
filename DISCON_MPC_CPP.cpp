@@ -47,6 +47,15 @@ namespace
         int turbulentWindBand = -1;
         float lastTuningTraceTime = -1.0f;
         bool lastTuningTraceFallbackState = false;
+        float lastCommandTraceTime = -1.0f;
+        bool hasOneStepPrediction = false;
+        float oneStepPredictionIssuedTime = 0.0f;
+        float oneStepPredictionTime = 0.0f;
+        float oneStepPredictionDt = 0.0f;
+        float oneStepPredOmegaRef = 0.0f;
+        float oneStepPredDOmega = 0.0f;
+        float oneStepPredTowerDispFA = 0.0f;
+        float oneStepPredTowerVelFA = 0.0f;
     };
 
     struct GainTableData
@@ -113,10 +122,11 @@ namespace
     std::string gPredictionLogPath;
     std::string gInputTracePath;
     std::string gTuningTracePath;
+    std::string gCommandTracePath;
     bool gEnableTraceFiles = true;
     bool gEnablePredictionTrace = false;
     bool gEnableInputTrace = false;
-    bool gEnableTuningTrace = true;
+    bool gEnableTuningTrace = false;
     int gCurrentTerminalIndex = -1;
 
     constexpr float D2R = 0.017453292f;
@@ -181,6 +191,7 @@ namespace
     constexpr float LIDAR_HISTORY_MAX_AGE = 30.0f;   // seconds of lidar history kept for preview mapping
     constexpr float OPERATING_WIND_REF_TAU = 1.0f / 1.570796f; // matched to baseline DISCON CornerFreq [s]
     constexpr float TUNING_TRACE_DT = 0.5f;          // seconds between ordinary tuning-trace rows
+    constexpr float COMMAND_TRACE_DT = 0.01f;        // dataset-aligned command-trace sampling interval [s]
     constexpr float TURB_WIND_BAND_HYST = 0.5f;      // [m/s] hysteresis on filtered mean wind band switching
     constexpr float TURB_WIND_BAND_0_MAX = 9.0f;     // 8 m/s anchor
     constexpr float TURB_WIND_BAND_1_MAX = 13.0f;    // 10/12 m/s anchor block
@@ -214,6 +225,9 @@ namespace
     float gPredictionDt = 0.000125f;
     float gTerminalCostScale = 1.0f;
     float gTerminalUnloadTriggerRpm = TERMINAL_UNLOAD_TRIGGER_RPM_DEFAULT;
+    int   gActuatorOrder = 0;
+    float gPitchActuatorTau = 0.25f;
+    float gTorqueActuatorTau = 0.25f;
 
     constexpr int   N_STATE = 5;
     constexpr int   N_CTRL = 2;
@@ -908,14 +922,18 @@ namespace
         // legacy newest format: 27 data lines, lines 21:23 are unused hard limits,
         // line 24 is MPC_DT, line 25 toggles trace-file generation,
         // line 26 sets the qpOASES nWSR iteration budget, and line 27 scales the terminal cost
-        // current format: 25 data lines, line 12 is TERMINAL_UNLOAD_OMEGA_RPM and the unused hard limits are removed
-        const bool hasTerminalUnloadLine = (lines.size() >= 25 && lines.size() < 27);
+        // current format: 25+ data lines, line 12 is TERMINAL_UNLOAD_OMEGA_RPM and the unused hard limits are removed
+        const bool hasTerminalUnloadLine =
+            (lines.size() >= 25 && std::fabs(std::stof(lines[11]) - std::round(std::stof(lines[11]))) > 1.0e-6f);
         std::size_t idx = 11;
         gNPred = 5;
         gNCtrlH = 5;
         gNWSR = 200;
         gPredictionDt = 0.000125f;
         gTerminalCostScale = 1.0f;
+        gActuatorOrder = 0;
+        gPitchActuatorTau = 0.25f;
+        gTorqueActuatorTau = 0.25f;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         gEnableTraceFiles = true;
@@ -1001,6 +1019,29 @@ namespace
             return false;
         }
 
+        if (lines.size() > idx)
+        {
+            gActuatorOrder = std::stoi(lines[idx++]);
+        }
+        if (lines.size() > idx)
+        {
+            gPitchActuatorTau = std::stof(lines[idx++]);
+        }
+        if (lines.size() > idx)
+        {
+            gTorqueActuatorTau = std::stof(lines[idx++]);
+        }
+        if (gActuatorOrder != 0 && gActuatorOrder != 1)
+        {
+            err = "ACTUATOR_ORDER must be 0 or 1.";
+            return false;
+        }
+        if (gPitchActuatorTau < 0.0f || gTorqueActuatorTau < 0.0f)
+        {
+            err = "Actuator time constants must be nonnegative.";
+            return false;
+        }
+
         gTable.loaded = true;
         return true;
     }
@@ -1028,6 +1069,16 @@ namespace
             gState.operatingWindRef = clampToRange(gState.operatingWindRef, gTable.windPtsMs.front(), gTable.windPtsMs.back());
 
         return gState.operatingWindRef;
+    }
+
+    inline float applyFirstOrderActuator(float previousApplied, float target, float dtController, float tau)
+    {
+        if (gActuatorOrder == 0 || tau <= 0.0f)
+            return target;
+
+        const float dt = std::max(dtController, 0.0f);
+        const float alpha = 1.0f - std::exp(-dt / std::max(tau, 1.0e-6f));
+        return previousApplied + alpha * (target - previousApplied);
     }
 
     inline int classifyTurbulentWindBand(float windRef)
@@ -1303,6 +1354,148 @@ namespace
             << xMeas << ','
             << vMeas << ','
             << windMeas << '\n';
+    }
+
+    inline void writeCommandTraceHeader(const std::string& path)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        resetDebugLog(path);
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        out << "time_s,iStatus,fracture_active,qp_solved,fallback_used,fallback_count,terminal_idx,"
+               "rotSpeed_rpm,genSpeed_rpm,towerDispFA_m,towerVelFA_mps,horWindV_mps,operatingWindRef_mps,"
+               "tg_ref_Nm,beta_ref_rad,beta_ref_deg,prevGenTorque_Nm,prevPitchCmd_rad,prevPitchCmd_deg,"
+               "demandedGenTorque_Nm,demandedPitch_rad,demandedPitch_deg,demandedPitchRate_radps,demandedPitchRate_degps,"
+               "appliedGenTorque_Nm,appliedPitch_rad,appliedPitch_deg,appliedPitchRate_radps,appliedPitchRate_degps,"
+               "targetMinusAppliedGenTorque_Nm,targetMinusAppliedPitch_rad,targetMinusAppliedPitch_deg,"
+               "deltaTg_cmd_Nm,deltaBeta_cmd_rad,has_pred_1step,pred_issued_time_s,pred_time_s,actual_time_s,"
+               "pred_dOmega_radps,actual_dOmega_radps,err_dOmega_radps,"
+               "pred_rotSpeed_rpm,actual_rotSpeed_rpm,err_rotSpeed_rpm,"
+               "pred_towerDispFA_m,actual_towerDispFA_m,err_towerDispFA_m,"
+               "pred_towerVelFA_mps,actual_towerVelFA_mps,err_towerVelFA_mps,pred_dt_s,actual_dt_s\n";
+    }
+
+    inline void appendCommandTraceRow(
+        const std::string& path,
+        float time,
+        int iStatus,
+        bool fractureActive,
+        bool qpSolved,
+        bool fallbackUsed,
+        int fallbackCount,
+        int terminalIdx,
+        float rotSpeedRpm,
+        float genSpeedRpm,
+        float towerDispFA,
+        float towerVelFA,
+        float horWindV,
+        float operatingWindRef,
+        float tgRefNow,
+        float betaRefNow,
+        float prevGenTorque,
+        float prevPitchCmd,
+        float demandedGenTorque,
+        float demandedPitch,
+        float demandedPitchRate,
+        float appliedGenTorque,
+        float appliedPitch,
+        float appliedPitchRate,
+        bool hasPred1Step,
+        float predIssuedTime,
+        float predTime,
+        float predDOmega,
+        float actualDOmega,
+        float predRotSpeedRpm,
+        float actualRotSpeedRpm,
+        float predTowerDispFA,
+        float actualTowerDispFA,
+        float predTowerVelFA,
+        float actualTowerVelFA,
+        float predDt,
+        float actualDt)
+    {
+        if (!gEnableTraceFiles) return;
+        if (path.empty()) return;
+        const bool periodicDue =
+            (gState.lastCommandTraceTime < 0.0f) ||
+            ((time - gState.lastCommandTraceTime) >= (COMMAND_TRACE_DT - 1.0e-6f));
+        if (!periodicDue && !fallbackUsed && !hasPred1Step)
+            return;
+
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        if (!hasPred1Step)
+        {
+            predIssuedTime = nan;
+            predTime = nan;
+            predDOmega = nan;
+            actualDOmega = nan;
+            predRotSpeedRpm = nan;
+            actualRotSpeedRpm = nan;
+            predTowerDispFA = nan;
+            actualTowerDispFA = nan;
+            predTowerVelFA = nan;
+            actualTowerVelFA = nan;
+            predDt = nan;
+            actualDt = nan;
+        }
+
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        gState.lastCommandTraceTime = time;
+        out << std::fixed << std::setprecision(6)
+            << time << ','
+            << iStatus << ','
+            << (fractureActive ? 1 : 0) << ','
+            << (qpSolved ? 1 : 0) << ','
+            << (fallbackUsed ? 1 : 0) << ','
+            << fallbackCount << ','
+            << terminalIdx << ','
+            << rotSpeedRpm << ','
+            << genSpeedRpm << ','
+            << towerDispFA << ','
+            << towerVelFA << ','
+            << horWindV << ','
+            << operatingWindRef << ','
+            << tgRefNow << ','
+            << betaRefNow << ','
+            << betaRefNow * R2D << ','
+            << prevGenTorque << ','
+            << prevPitchCmd << ','
+            << prevPitchCmd * R2D << ','
+            << demandedGenTorque << ','
+            << demandedPitch << ','
+            << demandedPitch * R2D << ','
+            << demandedPitchRate << ','
+            << demandedPitchRate * R2D << ','
+            << appliedGenTorque << ','
+            << appliedPitch << ','
+            << appliedPitch * R2D << ','
+            << appliedPitchRate << ','
+            << appliedPitchRate * R2D << ','
+            << demandedGenTorque - appliedGenTorque << ','
+            << demandedPitch - appliedPitch << ','
+            << (demandedPitch - appliedPitch) * R2D << ','
+            << demandedGenTorque - prevGenTorque << ','
+            << demandedPitch - prevPitchCmd << ','
+            << (hasPred1Step ? 1 : 0) << ','
+            << predIssuedTime << ','
+            << predTime << ','
+            << time << ','
+            << predDOmega << ','
+            << actualDOmega << ','
+            << predDOmega - actualDOmega << ','
+            << predRotSpeedRpm << ','
+            << actualRotSpeedRpm << ','
+            << predRotSpeedRpm - actualRotSpeedRpm << ','
+            << predTowerDispFA << ','
+            << actualTowerDispFA << ','
+            << predTowerDispFA - actualTowerDispFA << ','
+            << predTowerVelFA << ','
+            << actualTowerVelFA << ','
+            << predTowerVelFA - actualTowerVelFA << ','
+            << predDt << ','
+            << actualDt << '\n';
     }
 
     inline void writeInputTraceHeader(const std::string& path)
@@ -2107,6 +2300,18 @@ namespace
             predMaxAbsXt = std::max(predMaxAbsXt, std::fabs(xPred));
             predMaxAbsVt = std::max(predMaxAbsVt, std::fabs(vPred));
 
+            if (p == 0 && !gState.hasOneStepPrediction)
+            {
+                gState.hasOneStepPrediction = true;
+                gState.oneStepPredictionIssuedTime = time;
+                gState.oneStepPredictionTime = time + dtPred;
+                gState.oneStepPredictionDt = dtPred;
+                gState.oneStepPredOmegaRef = getRotorSpeedReference(gState.oneStepPredictionTime);
+                gState.oneStepPredDOmega = dOmegaPred;
+                gState.oneStepPredTowerDispFA = xPred;
+                gState.oneStepPredTowerVelFA = vPred;
+            }
+
             float tgErrPred = 0.0f;
             float betaErrPred = 0.0f;
             for (int j = 0; j < NU; ++j)
@@ -2255,6 +2460,15 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastStepUsedFallback = false;
         gState.lastTuningTraceTime = -1.0f;
         gState.lastTuningTraceFallbackState = false;
+        gState.lastCommandTraceTime = -1.0f;
+        gState.hasOneStepPrediction = false;
+        gState.oneStepPredictionIssuedTime = 0.0f;
+        gState.oneStepPredictionTime = 0.0f;
+        gState.oneStepPredictionDt = 0.0f;
+        gState.oneStepPredOmegaRef = 0.0f;
+        gState.oneStepPredDOmega = 0.0f;
+        gState.oneStepPredTowerDispFA = 0.0f;
+        gState.oneStepPredTowerVelFA = 0.0f;
         gState.operatingWindRefInitialized = false;
         gState.operatingWindRef = 0.0f;
         gState.turbulentWindBand = -1;
@@ -2274,6 +2488,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gPredictionLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_prediction.csv");
         gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
         gTuningTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_tuning_trace.csv");
+        gCommandTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_command_trace.csv");
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
         bool terminalBuilt = false;
         if (tablesLoaded)
@@ -2282,6 +2497,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         writePredictionLogHeader(gPredictionLogPath);
         writeInputTraceHeader(gInputTracePath);
         writeTuningTraceHeader(gTuningTracePath);
+        writeCommandTraceHeader(gCommandTracePath);
 
         if (tablesLoaded && terminalBuilt)
             initializeBaselineStates(time, genSpeed, bladePitch1);
@@ -2295,6 +2511,9 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 << ", MPC_DT=" << gPredictionDt
                 << ", nWSR=" << gNWSR
                 << ", terminalScale=" << gTerminalCostScale
+                << ", actuatorOrder=" << gActuatorOrder
+                << ", pitchTau=" << gPitchActuatorTau
+                << ", torqueTau=" << gTorqueActuatorTau
                 << ", terminalFallbackPts=" << gTerminal.fallbackPoints << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }
@@ -2333,6 +2552,27 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.fractureActive = true;
     }
 
+    const float prevGenTorqueForTrace = gState.lastGenTorque;
+    const float prevPitchCmdForTrace = gState.pitchCmd;
+    const bool hasPredForTrace =
+        gState.hasOneStepPrediction &&
+        (time + 1.0e-6f >= gState.oneStepPredictionTime);
+    const float predIssuedTimeForTrace = gState.oneStepPredictionIssuedTime;
+    const float predTimeForTrace = gState.oneStepPredictionTime;
+    const float predDtForTrace = gState.oneStepPredictionDt;
+    const float predDOmegaForTrace = gState.oneStepPredDOmega;
+    const float actualDOmegaForTrace = rotSpeed - getRotorSpeedReference(time);
+    const float predRotSpeedRpmForTrace =
+        (gState.oneStepPredDOmega + gState.oneStepPredOmegaRef) * RPS2RPM;
+    const float actualRotSpeedRpmForTrace = rotSpeed * RPS2RPM;
+    const float predTowerDispFAForTrace = gState.oneStepPredTowerDispFA;
+    const float actualTowerDispFAForTrace = towerDispFA;
+    const float predTowerVelFAForTrace = gState.oneStepPredTowerVelFA;
+    const float actualTowerVelFAForTrace = towerVelFA;
+    const float actualDtForTrace = time - predIssuedTimeForTrace;
+    if (hasPredForTrace)
+        gState.hasOneStepPrediction = false;
+
     appendInputTraceRow(
         gInputTracePath,
         time,
@@ -2354,6 +2594,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
+    bool qpSolvedForTrace = false;
+    bool fallbackUsedForTrace = false;
 
     if (!gState.fractureActive)
     {
@@ -2384,6 +2626,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             demandedGenTorque,
             demandedPitch
         );
+        qpSolvedForTrace = qpSolved;
 
         if (!qpSolved)
         {
@@ -2399,6 +2642,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 demandedPitch
             );
             gState.lastStepUsedFallback = true;
+            fallbackUsedForTrace = true;
             gState.fallbackCount += 1;
             *aviFAIL = 1;
             writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
@@ -2460,22 +2704,74 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
 
     const float demandedPitchRate = std::clamp((demandedPitch - gState.pitchCmd) / dt, -PC_MAX_RAT, PC_MAX_RAT);
+    const float appliedGenTorque = std::clamp(
+        applyFirstOrderActuator(gState.lastGenTorque, demandedGenTorque, dt, gTorqueActuatorTau),
+        VS_MIN_TQ,
+        VS_MAX_TQ
+    );
+    const float appliedPitch = std::clamp(
+        applyFirstOrderActuator(gState.pitchCmd, demandedPitch, dt, gPitchActuatorTau),
+        PC_MIN_PIT,
+        PC_MAX_PIT
+    );
+    const float appliedPitchRate = std::clamp((appliedPitch - gState.pitchCmd) / dt, -PC_MAX_RAT, PC_MAX_RAT);
+    const float tgRefForTrace = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
+    const float betaRefForTrace = getPitchReference(time);
+    appendCommandTraceRow(
+        gCommandTracePath,
+        time,
+        iStatus,
+        gState.fractureActive,
+        qpSolvedForTrace,
+        fallbackUsedForTrace,
+        gState.fallbackCount,
+        gCurrentTerminalIndex,
+        rotSpeed * RPS2RPM,
+        genSpeed * RPS2RPM,
+        towerDispFA,
+        towerVelFA,
+        horWindV,
+        gState.operatingWindRef,
+        tgRefForTrace,
+        betaRefForTrace,
+        prevGenTorqueForTrace,
+        prevPitchCmdForTrace,
+        demandedGenTorque,
+        demandedPitch,
+        demandedPitchRate,
+        appliedGenTorque,
+        appliedPitch,
+        appliedPitchRate,
+        hasPredForTrace,
+        predIssuedTimeForTrace,
+        predTimeForTrace,
+        predDOmegaForTrace,
+        actualDOmegaForTrace,
+        predRotSpeedRpmForTrace,
+        actualRotSpeedRpmForTrace,
+        predTowerDispFAForTrace,
+        actualTowerDispFAForTrace,
+        predTowerVelFAForTrace,
+        actualTowerVelFAForTrace,
+        predDtForTrace,
+        actualDtForTrace
+    );
 
     avrSWAP[34] = 1.0f;            // avrSWAP(35)  generator contactor: main variable-speed generator
-    avrSWAP[46] = demandedGenTorque; // avrSWAP(47) demanded generator torque
+    avrSWAP[46] = appliedGenTorque; // avrSWAP(47) demanded generator torque
     avrSWAP[55] = 0.0f;            // avrSWAP(56) torque override = yes
 
-    avrSWAP[41] = demandedPitch;   // avrSWAP(42) blade 1 pitch command
-    avrSWAP[42] = demandedPitch;   // avrSWAP(43) blade 2 pitch command
-    avrSWAP[43] = demandedPitch;   // avrSWAP(44) blade 3 pitch command
-    avrSWAP[44] = demandedPitch;   // avrSWAP(45) collective pitch command
+    avrSWAP[41] = appliedPitch;    // avrSWAP(42) blade 1 pitch command
+    avrSWAP[42] = appliedPitch;    // avrSWAP(43) blade 2 pitch command
+    avrSWAP[43] = appliedPitch;    // avrSWAP(44) blade 3 pitch command
+    avrSWAP[44] = appliedPitch;    // avrSWAP(45) collective pitch command
     avrSWAP[54] = 0.0f;            // avrSWAP(55) pitch override = yes
-    avrSWAP[45] = demandedPitchRate; // avrSWAP(46) demanded collective pitch rate
+    avrSWAP[45] = appliedPitchRate; // avrSWAP(46) demanded collective pitch rate
 
     gState.lastTime = time;
-    gState.lastGenTorque = demandedGenTorque;
-    gState.pitchCmd = demandedPitch;
-    gState.lastPitchRate = demandedPitchRate;
+    gState.lastGenTorque = appliedGenTorque;
+    gState.pitchCmd = appliedPitch;
+    gState.lastPitchRate = appliedPitchRate;
 
     if (gState.fractureActive)
     {
