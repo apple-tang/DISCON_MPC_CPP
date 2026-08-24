@@ -244,7 +244,6 @@ namespace
     inline float getGeneratorTorqueReference(float time, float rotSpeed, float windNow);
     inline float getRotorSpeedReference(float time);
     inline float getPitchReference(float time);
-    inline float actuatorRetention(float dtController, float tau);
 
     struct TerminalScheduleData
     {
@@ -520,22 +519,18 @@ namespace
                 const float b11 = -dt * N_gear / gJEQRuntime;
                 const float b12 = dt * gTBetaNow / gJEQRuntime;
                 const float b32 = dt * gFBetaNow / M_T;
-                const float tgRetain = actuatorRetention(dt, gTorqueActuatorTau);
-                const float betaRetain = actuatorRetention(dt, gPitchActuatorTau);
-                const float tgCmdGain = 1.0f - tgRetain;
-                const float betaCmdGain = 1.0f - betaRetain;
 
-                A[0 * N_STATE + 0] = a11;  A[0 * N_STATE + 3] = b11 * tgRetain;  A[0 * N_STATE + 4] = b12 * betaRetain;
+                A[0 * N_STATE + 0] = a11;  A[0 * N_STATE + 3] = b11;  A[0 * N_STATE + 4] = b12;
                 A[1 * N_STATE + 1] = 1.0f; A[1 * N_STATE + 2] = a23;
-                A[2 * N_STATE + 0] = a31;  A[2 * N_STATE + 1] = a32;  A[2 * N_STATE + 2] = a33; A[2 * N_STATE + 4] = b32 * betaRetain;
-                A[3 * N_STATE + 3] = tgRetain;
-                A[4 * N_STATE + 4] = betaRetain;
+                A[2 * N_STATE + 0] = a31;  A[2 * N_STATE + 1] = a32;  A[2 * N_STATE + 2] = a33; A[2 * N_STATE + 4] = b32;
+                A[3 * N_STATE + 3] = 1.0f;
+                A[4 * N_STATE + 4] = 1.0f;
 
-                B[0 * N_CTRL + 0] = b11 * tgCmdGain;  B[0 * N_CTRL + 1] = b12 * betaCmdGain;
+                B[0 * N_CTRL + 0] = b11;  B[0 * N_CTRL + 1] = b12;
                 B[1 * N_CTRL + 0] = 0.0f; B[1 * N_CTRL + 1] = 0.0f;
-                B[2 * N_CTRL + 0] = 0.0f; B[2 * N_CTRL + 1] = b32 * betaCmdGain;
-                B[3 * N_CTRL + 0] = tgCmdGain; B[3 * N_CTRL + 1] = 0.0f;
-                B[4 * N_CTRL + 0] = 0.0f; B[4 * N_CTRL + 1] = betaCmdGain;
+                B[2 * N_CTRL + 0] = 0.0f; B[2 * N_CTRL + 1] = b32;
+                B[3 * N_CTRL + 0] = 1.0f; B[3 * N_CTRL + 1] = 0.0f;
+                B[4 * N_CTRL + 0] = 0.0f; B[4 * N_CTRL + 1] = 1.0f;
 
                 MatNN P{};
                 MatUN K{};
@@ -695,35 +690,25 @@ namespace
         float rotSpeed,
         float towerDispFA,
         float towerVelFA,
-        float prevAppliedGenTorque,
-        float prevAppliedPitch,
-        float prevCommandGenTorque,
-        float prevCommandPitch,
+        float prevGenTorque,
+        float prevPitchCmd,
         float& demandedGenTorque,
         float& demandedPitchCmd)
     {
         const float rotSpeedRPM = rotSpeed * RPS2RPM;
         const MatUN K = getScheduledTerminalK(windRef, rotSpeedRPM);
-        const auto z = buildAugmentedState(time, rotSpeed, windRef, towerDispFA, towerVelFA, prevAppliedGenTorque, prevAppliedPitch);
+        const auto z = buildAugmentedState(time, rotSpeed, windRef, towerDispFA, towerVelFA, prevGenTorque, prevPitchCmd);
 
-        float cmdTgErr = 0.0f;
-        float cmdBetaErr = 0.0f;
+        float deltaTg = 0.0f;
+        float deltaBeta = 0.0f;
         for (int j = 0; j < N_STATE; ++j)
         {
-            cmdTgErr += K[0 * N_STATE + j] * z[j];
-            cmdBetaErr += K[1 * N_STATE + j] * z[j];
+            deltaTg += K[0 * N_STATE + j] * z[j];
+            deltaBeta += K[1 * N_STATE + j] * z[j];
         }
 
-        const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, windRef);
-        const float betaRefNow = getPitchReference(time);
-        const float dTgMax = VS_MAX_TQ_RATE * std::max(gPredictionDt, 1.0e-4f);
-        const float dBetaMax = PC_MAX_RAT * std::max(gPredictionDt, 1.0e-4f);
-        demandedGenTorque = std::clamp(tgRefNow + cmdTgErr, VS_MIN_TQ, VS_MAX_TQ);
-        demandedPitchCmd = std::clamp(betaRefNow + cmdBetaErr, PC_MIN_PIT, PC_MAX_PIT);
-        demandedGenTorque = std::clamp(demandedGenTorque, prevCommandGenTorque - dTgMax, prevCommandGenTorque + dTgMax);
-        demandedPitchCmd = std::clamp(demandedPitchCmd, prevCommandPitch - dBetaMax, prevCommandPitch + dBetaMax);
-        demandedGenTorque = std::clamp(demandedGenTorque, VS_MIN_TQ, VS_MAX_TQ);
-        demandedPitchCmd = std::clamp(demandedPitchCmd, PC_MIN_PIT, PC_MAX_PIT);
+        demandedGenTorque = std::clamp(prevGenTorque + deltaTg, VS_MIN_TQ, VS_MAX_TQ);
+        demandedPitchCmd = std::clamp(prevPitchCmd + deltaBeta, PC_MIN_PIT, PC_MAX_PIT);
     }
 
 
@@ -1096,14 +1081,6 @@ namespace
         const float dt = std::max(dtController, 0.0f);
         const float alpha = 1.0f - std::exp(-dt / std::max(tau, 1.0e-6f));
         return previousApplied + alpha * (target - previousApplied);
-    }
-
-    inline float actuatorRetention(float dtController, float tau)
-    {
-        if (gActuatorOrder == 0 || tau <= 0.0f)
-            return 0.0f;
-        const float dt = std::max(dtController, 0.0f);
-        return std::exp(-dt / std::max(tau, 1.0e-6f));
     }
 
     inline int classifyTurbulentWindBand(float windRef)
@@ -1951,10 +1928,8 @@ namespace
         float towerDispFA,
         float towerVelFA,
         const LidarPreviewData& lidar,
-        float prevAppliedGenTorque,
-        float prevAppliedPitch,
-        float prevCommandGenTorque,
-        float prevCommandPitch,
+        float prevGenTorque,
+        float prevPitchCmd,
         std::string& solveErr,
         float& demandedGenTorque,
         float& demandedPitchCmd)
@@ -1979,17 +1954,13 @@ namespace
         const float gFBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta, windRef, rotSpeedRPM) : G_FBETA_DEFAULT;
         const float gFUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu, windRef, rotSpeedRPM) : G_FU_DEFAULT;
 
-        // Augmented state with first-order actuator memory:
-        // xbar = [ dOmega, x_t, v_t, Tg_applied - Tg_ref, beta_applied - beta_ref ]^T.
-        // The QP decision variables are absolute command errors
-        // [Tg_cmd - Tg_ref, beta_cmd - beta_ref], not command increments.
+        // Augmented state:
+        // xbar = [ dOmega, x_t, v_t, Tg - Tg_ref(time, omega), beta - beta_ref ]^T
         const float x0 = rotSpeed - omegaRefNow;
         const float x1 = towerDispFA;
         const float x2 = towerVelFA;
-        const float x3 = prevAppliedGenTorque - tgRefNow;
-        const float x4 = prevAppliedPitch - betaRefNow;
-        const float prevCommandTgErr = prevCommandGenTorque - tgRefNow;
-        const float prevCommandBetaErr = prevCommandPitch - betaRefNow;
+        const float x3 = prevGenTorque - tgRefNow;
+        const float x4 = prevPitchCmd - betaRefNow;
 
         std::array<float, N_STATE> xbar0 = { x0, x1, x2, x3, x4 };
 
@@ -2011,22 +1982,18 @@ namespace
         const float b32 = dtPred * gFBetaNow / M_T;
         const float e11 = dtPred * gTUNow / gJEQRuntime;
         const float e31 = dtPred * gFUNow / M_T;
-        const float tgRetain = actuatorRetention(dtPred, gTorqueActuatorTau);
-        const float betaRetain = actuatorRetention(dtPred, gPitchActuatorTau);
-        const float tgCmdGain = 1.0f - tgRetain;
-        const float betaCmdGain = 1.0f - betaRetain;
 
-        Aat(0, 0) = a11;  Aat(0, 3) = b11 * tgRetain;  Aat(0, 4) = b12 * betaRetain;
+        Aat(0, 0) = a11;  Aat(0, 3) = b11;  Aat(0, 4) = b12;
         Aat(1, 1) = a22;  Aat(1, 2) = a23;
-        Aat(2, 0) = a31;  Aat(2, 1) = a32;  Aat(2, 2) = a33;  Aat(2, 4) = b32 * betaRetain;
-        Aat(3, 3) = tgRetain;
-        Aat(4, 4) = betaRetain;
+        Aat(2, 0) = a31;  Aat(2, 1) = a32;  Aat(2, 2) = a33;  Aat(2, 4) = b32;
+        Aat(3, 3) = 1.0f;
+        Aat(4, 4) = 1.0f;
 
-        Bat(0, 0) = b11 * tgCmdGain;  Bat(0, 1) = b12 * betaCmdGain;
+        Bat(0, 0) = b11;  Bat(0, 1) = b12;
         Bat(1, 0) = 0.0f; Bat(1, 1) = 0.0f;
-        Bat(2, 0) = 0.0f; Bat(2, 1) = b32 * betaCmdGain;
-        Bat(3, 0) = tgCmdGain; Bat(3, 1) = 0.0f;
-        Bat(4, 0) = 0.0f; Bat(4, 1) = betaCmdGain;
+        Bat(2, 0) = 0.0f; Bat(2, 1) = b32;
+        Bat(3, 0) = 1.0f; Bat(3, 1) = 0.0f;
+        Bat(4, 0) = 0.0f; Bat(4, 1) = 1.0f;
 
         Ebar[0] = e11;
         Ebar[1] = 0.0f;
@@ -2042,7 +2009,7 @@ namespace
         // Build prediction matrices X = F*x0 + G*U
         const int NX = N_STATE * nPred;
         const int NU = N_CTRL * nCtrlH;
-        const int NC_INPUT = NU;
+        const int NC_INPUT = 2 * NU;
         const int NC_STATE = nPred;
         const int NC = NC_INPUT + NC_STATE;
         if (gSolverWs.nx != NX || gSolverWs.nu != NU || gSolverWs.nc != NC)
@@ -2108,37 +2075,36 @@ namespace
                 return R;
             };
 
-        std::vector<float> sensitivity(static_cast<std::size_t>(N_STATE * NU), 0.0f);
-        std::vector<float> nextSensitivity(static_cast<std::size_t>(N_STATE * NU), 0.0f);
+        std::array<float, N_STATE* N_STATE> Apow{};
+        for (int i = 0; i < N_STATE; ++i) Apow[i * N_STATE + i] = 1.0f;
+        auto& powers = gSolverWs.powers;
         for (int p = 0; p < nPred; ++p)
         {
-            std::fill(nextSensitivity.begin(), nextSensitivity.end(), 0.0f);
-            for (int i = 0; i < N_STATE; ++i)
-            {
-                for (int j = 0; j < NU; ++j)
-                {
-                    float acc = 0.0f;
-                    for (int k = 0; k < N_STATE; ++k)
-                        acc += Abar[i * N_STATE + k] * sensitivity[k * NU + j];
-                    nextSensitivity[i * NU + j] = acc;
-                }
-            }
-
-            const int cmdBlk = std::min(p, nCtrlH - 1);
-            for (int i = 0; i < N_STATE; ++i)
-            {
-                for (int j = 0; j < N_CTRL; ++j)
-                    nextSensitivity[i * NU + (cmdBlk * N_CTRL + j)] += Bbar[i * N_CTRL + j];
-            }
-
-            for (int i = 0; i < N_STATE; ++i)
-                for (int j = 0; j < NU; ++j)
-                    G[(p * N_STATE + i) * NU + j] = nextSensitivity[i * NU + j];
-
-            sensitivity.swap(nextSensitivity);
+            Apow = matMulSq(Abar, Apow);
+            powers[p] = Apow;
         }
 
-        // c = predicted state stack under zero absolute command errors.
+        for (int p = 0; p < nPred; ++p)
+        {
+            for (int c = 0; c <= p && c < nCtrlH; ++c)
+            {
+                std::array<float, N_STATE* N_CTRL> block{};
+                if (p == c)
+                {
+                    block = Bbar;
+                }
+                else
+                {
+                    block = matMulAB(powers[p - c - 1], Bbar);
+                }
+
+                for (int i = 0; i < N_STATE; ++i)
+                    for (int j = 0; j < N_CTRL; ++j)
+                        G[(p * N_STATE + i) * NU + (c * N_CTRL + j)] = block[i * N_CTRL + j];
+            }
+        }
+
+        // c = predicted state stack under zero control increments.
         // If lidar preview is available, each prediction step uses the
         // corresponding preview disturbance dWindPreview[p]. Otherwise, fall
         // back to the legacy constant-over-horizon disturbance dWind.
@@ -2203,88 +2169,51 @@ namespace
                 g[i] += static_cast<real_t>(2.0f * linearTerm);
             }
         }
-        for (int p = 0; p < nCtrlH; ++p)
-        {
-            for (int ctrl = 0; ctrl < N_CTRL; ++ctrl)
-            {
-                const int idx = p * N_CTRL + ctrl;
-                const float weight = (ctrl == 0) ? gRT : gRB;
-                H[idx * NU + idx] += static_cast<real_t>(2.0f * weight);
-                if (p == 0)
-                {
-                    const float prevCmdErr = (ctrl == 0) ? prevCommandTgErr : prevCommandBetaErr;
-                    g[idx] += static_cast<real_t>(-2.0f * weight * prevCmdErr);
-                }
-                else
-                {
-                    const int prevIdx = (p - 1) * N_CTRL + ctrl;
-                    H[prevIdx * NU + prevIdx] += static_cast<real_t>(2.0f * weight);
-                    H[idx * NU + prevIdx] -= static_cast<real_t>(2.0f * weight);
-                    H[prevIdx * NU + idx] -= static_cast<real_t>(2.0f * weight);
-                }
-            }
-        }
+        for (int i = 0; i < NU; ++i)
+            H[i * NU + i] += static_cast<real_t>(2.0f * (((i % N_CTRL) == 0) ? gRT : gRB));
 
-        // Bounds on absolute command errors
+        // Bounds on input increments
         const float dTgRatePred = VS_MAX_TQ_RATE * dtPred;
         const float dBetaRatePred = PC_MAX_RAT * dtPred;
 
         for (int p = 0; p < nCtrlH; ++p)
         {
-            lb[p * N_CTRL + 0] = static_cast<real_t>(VS_MIN_TQ - tgRefNow);
-            ub[p * N_CTRL + 0] = static_cast<real_t>(VS_MAX_TQ - tgRefNow);
-            lb[p * N_CTRL + 1] = static_cast<real_t>(PC_MIN_PIT - betaRefNow);
-            ub[p * N_CTRL + 1] = static_cast<real_t>(PC_MAX_PIT - betaRefNow);
+            lb[p * N_CTRL + 0] = static_cast<real_t>(-dTgRatePred);
+            ub[p * N_CTRL + 0] = static_cast<real_t>(dTgRatePred);
+            lb[p * N_CTRL + 1] = static_cast<real_t>(-dBetaRatePred);
+            ub[p * N_CTRL + 1] = static_cast<real_t>(dBetaRatePred);
         }
 
-        // Rate constraints on consecutive absolute commands.
+        // Absolute-input constraints through cumulative-sum matrix Tu
         for (int rowBlk = 0; rowBlk < nCtrlH; ++rowBlk)
         {
-            const int rowTg = rowBlk * N_CTRL + 0;
-            const int rowBeta = rowBlk * N_CTRL + 1;
-            const int idxTg = rowBlk * N_CTRL + 0;
-            const int idxBeta = rowBlk * N_CTRL + 1;
-            Acon[rowTg * NU + idxTg] = 1.0;
-            Acon[rowBeta * NU + idxBeta] = 1.0;
-            if (rowBlk == 0)
+            for (int colBlk = 0; colBlk <= rowBlk; ++colBlk)
             {
-                lbA[rowTg] = static_cast<real_t>(prevCommandTgErr - dTgRatePred);
-                ubA[rowTg] = static_cast<real_t>(prevCommandTgErr + dTgRatePred);
-                lbA[rowBeta] = static_cast<real_t>(prevCommandBetaErr - dBetaRatePred);
-                ubA[rowBeta] = static_cast<real_t>(prevCommandBetaErr + dBetaRatePred);
+                Acon[(rowBlk * N_CTRL + 0) * NU + (colBlk * N_CTRL + 0)] = 1.0;
+                Acon[(rowBlk * N_CTRL + 1) * NU + (colBlk * N_CTRL + 1)] = 1.0;
+                Acon[((rowBlk + nCtrlH) * N_CTRL + 0) * NU + (colBlk * N_CTRL + 0)] = -1.0;
+                Acon[((rowBlk + nCtrlH) * N_CTRL + 1) * NU + (colBlk * N_CTRL + 1)] = -1.0;
             }
-            else
-            {
-                Acon[rowTg * NU + ((rowBlk - 1) * N_CTRL + 0)] = -1.0;
-                Acon[rowBeta * NU + ((rowBlk - 1) * N_CTRL + 1)] = -1.0;
-                lbA[rowTg] = static_cast<real_t>(-dTgRatePred);
-                ubA[rowTg] = static_cast<real_t>(dTgRatePred);
-                lbA[rowBeta] = static_cast<real_t>(-dBetaRatePred);
-                ubA[rowBeta] = static_cast<real_t>(dBetaRatePred);
-            }
+
+            ubA[rowBlk * N_CTRL + 0] = static_cast<real_t>(VS_MAX_TQ - prevGenTorque);
+            ubA[rowBlk * N_CTRL + 1] = static_cast<real_t>(PC_MAX_PIT - prevPitchCmd);
+            ubA[(rowBlk + nCtrlH) * N_CTRL + 0] = static_cast<real_t>(prevGenTorque - VS_MIN_TQ);
+            ubA[(rowBlk + nCtrlH) * N_CTRL + 1] = static_cast<real_t>(prevPitchCmd - PC_MIN_PIT);
         }
 
-        // Predicted rotor-speed lower bound. Once the rotor is essentially
-        // stopped, this lower bound can conflict with the shutdown target.
-        const float omegaConstraintUnloadRpm = std::max(
-            gTerminalUnloadTriggerRpm,
-            getScheduledTerminalUnloadTriggerRpm(windRef)
-        );
-        if (rotSpeedRPM > omegaConstraintUnloadRpm)
+        // Predicted rotor-speed lower bound.
+        for (int p = 0; p < nPred; ++p)
         {
-            for (int p = 0; p < nPred; ++p)
-            {
-                const int row = NC_INPUT + p;
-                const int omegaStateIndex = p * N_STATE + 0;
-                for (int j = 0; j < NU; ++j)
-                    Acon[row * NU + j] = G[omegaStateIndex * NU + j];
+            const int row = NC_INPUT + p;
+            const int omegaStateIndex = p * N_STATE + 0;
+            for (int j = 0; j < NU; ++j)
+                Acon[row * NU + j] = G[omegaStateIndex * NU + j];
 
-                const float omegaRefPred = gShutdownRef.loaded
-                    ? getRotorSpeedReference(time + static_cast<float>(p + 1) * dtPred)
-                    : OMEGA_REF;
-                lbA[row] = static_cast<real_t>(OMEGA_MIN - omegaRefPred - c[omegaStateIndex]);
-                ubA[row] = static_cast<real_t>(BIG_POS);
-            }
+            const float omegaRefPred = gShutdownRef.loaded
+                ? getRotorSpeedReference(time + static_cast<float>(p + 1) * dtPred)
+                : OMEGA_REF;
+            lbA[row] = static_cast<real_t>(OMEGA_MIN - omegaRefPred - c[omegaStateIndex]);
+            ubA[row] = static_cast<real_t>(BIG_POS);
         }
 
         // create and solve QP
@@ -2334,19 +2263,15 @@ namespace
             return false;
         }
 
-        const float cmdTgErr = static_cast<float>(xOpt[0]);
-        const float cmdBetaErr = static_cast<float>(xOpt[1]);
+        const float dTg = static_cast<float>(xOpt[0]);
+        const float dBeta = static_cast<float>(xOpt[1]);
 
         const float dTgRateApply = VS_MAX_TQ_RATE * dtController;
         const float dBetaRateApply = PC_MAX_RAT * dtController;
-        const float rawDemandedGenTorque = std::clamp(tgRefNow + cmdTgErr, VS_MIN_TQ, VS_MAX_TQ);
-        const float rawDemandedPitchCmd = std::clamp(betaRefNow + cmdBetaErr, PC_MIN_PIT, PC_MAX_PIT);
-        demandedGenTorque = std::clamp(rawDemandedGenTorque, prevCommandGenTorque - dTgRateApply, prevCommandGenTorque + dTgRateApply);
-        demandedPitchCmd = std::clamp(rawDemandedPitchCmd, prevCommandPitch - dBetaRateApply, prevCommandPitch + dBetaRateApply);
-        demandedGenTorque = std::clamp(demandedGenTorque, VS_MIN_TQ, VS_MAX_TQ);
-        demandedPitchCmd = std::clamp(demandedPitchCmd, PC_MIN_PIT, PC_MAX_PIT);
-        const float dTgApplied = demandedGenTorque - prevCommandGenTorque;
-        const float dBetaApplied = demandedPitchCmd - prevCommandPitch;
+        const float dTgApplied = std::clamp(dTg, -dTgRateApply, dTgRateApply);
+        const float dBetaApplied = std::clamp(dBeta, -dBetaRateApply, dBetaRateApply);
+        demandedGenTorque = std::clamp(prevGenTorque + dTgApplied, VS_MIN_TQ, VS_MAX_TQ);
+        demandedPitchCmd = std::clamp(prevPitchCmd + dBetaApplied, PC_MIN_PIT, PC_MAX_PIT);
 
         float Jomega = 0.0f;
         float Jx = 0.0f;
@@ -2434,16 +2359,8 @@ namespace
 
         for (int p = 0; p < nCtrlH; ++p)
         {
-            const float tgCmdErr = static_cast<float>(xOpt[p * N_CTRL + 0]);
-            const float betaCmdErr = static_cast<float>(xOpt[p * N_CTRL + 1]);
-            const float prevTgCmdErr = (p == 0)
-                ? prevCommandTgErr
-                : static_cast<float>(xOpt[(p - 1) * N_CTRL + 0]);
-            const float prevBetaCmdErr = (p == 0)
-                ? prevCommandBetaErr
-                : static_cast<float>(xOpt[(p - 1) * N_CTRL + 1]);
-            const float duTg = tgCmdErr - prevTgCmdErr;
-            const float duBeta = betaCmdErr - prevBetaCmdErr;
+            const float duTg = static_cast<float>(xOpt[p * N_CTRL + 0]);
+            const float duBeta = static_cast<float>(xOpt[p * N_CTRL + 1]);
             JduTg += gRT * duTg * duTg;
             JduBeta += gRB * duBeta * duBeta;
         }
@@ -2465,8 +2382,8 @@ namespace
             dWind,
             tgRefNow,
             betaRefNow,
-            prevAppliedGenTorque,
-            prevAppliedPitch,
+            prevGenTorque,
+            prevPitchCmd,
             demandedGenTorque,
             demandedPitchCmd,
             dTgApplied,
@@ -2729,8 +2646,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             towerDispFA,
             towerVelFA,
             gLidar,
-            prevAppliedGenTorqueForActuator,
-            prevAppliedPitchForActuator,
             prevTargetGenTorqueForControl,
             prevTargetPitchForControl,
             qpErr,
@@ -2747,8 +2662,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 rotSpeed,
                 towerDispFA,
                 towerVelFA,
-                prevAppliedGenTorqueForActuator,
-                prevAppliedPitchForActuator,
                 prevTargetGenTorqueForControl,
                 prevTargetPitchForControl,
                 demandedGenTorque,
@@ -2763,7 +2676,7 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
             const float betaRefNow = getPitchReference(time);
             const std::array<float, N_STATE> z = buildAugmentedState(
-                time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, prevAppliedGenTorqueForActuator, prevAppliedPitchForActuator
+                time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, prevTargetGenTorqueForControl, prevTargetPitchForControl
             );
             appendTuningTraceRow(
                 gTuningTracePath,
@@ -2781,8 +2694,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 0.0f,
                 tgRefNow,
                 betaRefNow,
-                prevAppliedGenTorqueForActuator,
-                prevAppliedPitchForActuator,
+                prevTargetGenTorqueForControl,
+                prevTargetPitchForControl,
                 demandedGenTorque,
                 demandedPitch,
                 demandedGenTorque - prevTargetGenTorqueForControl,
@@ -2852,8 +2765,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.operatingWindRef,
         tgRefForTrace,
         betaRefForTrace,
-        prevTargetGenTorqueForControl,
-        prevTargetPitchForControl,
+        prevGenTorqueForTrace,
+        prevPitchCmdForTrace,
         demandedGenTorque,
         demandedPitch,
         demandedPitchRate,
