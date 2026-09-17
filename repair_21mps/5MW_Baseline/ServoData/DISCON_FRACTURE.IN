@@ -1,0 +1,23 @@
+! DISCON_Fracture input file
+! Line 1 : FractureBlade     -> fracture enable flag / blade index (0 disables fracture shutdown)
+1          ! FractureBlade
+! Line 2 : FractureTime      -> time to activate fracture shutdown logic (s)
+30.0       ! FractureTime [s]
+! Line 3 : RampTime          -> optional blend time from baseline control to fracture shutdown logic (s)
+0.0        ! RampTime [s]
+! Line 4 : FractureTau       -> generator torque exponential decay time constant after fracture (s) min:1e-3
+0.5        ! FractureTau [s]
+! Line 5 : FractureTorqueDelay -> hold time before generator torque decay starts after fracture (s)
+0.0       ! FractureTorqueDelay [s]
+! Line 6 : FracOmega1RPM     -> upper rotor-speed breakpoint for segmented feathering (rpm)
+7.2        ! FracOmega1RPM [rpm]
+! Line 7 : FracOmega2RPM     -> lower rotor-speed breakpoint for segmented feathering (rpm)
+5.8        ! FracOmega2RPM [rpm]
+! Line 8 : FracRate1DegS     -> pitch rate for Omega_r > FracOmega1RPM (deg/s)
+8.0        ! FracRate1DegS [deg/s]
+! Line 9 : FracRate2DegS     -> pitch rate for FracOmega2RPM < Omega_r <= FracOmega1RPM (deg/s)
+8.0        ! FracRate2DegS [deg/s]
+! Line 10: FracRate3DegS     -> pitch rate for Omega_r <= FracOmega2RPM (deg/s)
+4.0        ! FracRate3DegS [deg/s]
+! Line 11: FracFinalPitchDeg -> final collective feather angle during fracture shutdown (deg)
+90.0       ! FracFinalPitchDeg [deg]

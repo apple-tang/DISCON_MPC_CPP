@@ -5,9 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(MPC_ENABLE_TIMING "Enable low-overhead per-stage MPC timing instrumentation" OFF)
+
 add_library(DISCON_MPC_CPP SHARED DISCON_MPC_CPP.cpp)
 
 target_compile_definitions(DISCON_MPC_CPP PRIVATE _CRT_SECURE_NO_WARNINGS)
+if(MPC_ENABLE_TIMING)
+    target_compile_definitions(DISCON_MPC_CPP PRIVATE MPC_ENABLE_TIMING=1)
+endif()
 
 target_include_directories(DISCON_MPC_CPP PRIVATE "C:/Dev/qpOASES/include")
 target_link_libraries(DISCON_MPC_CPP PRIVATE "C:/Dev/qpOASES-build/libs/Release/qpOASES.lib")

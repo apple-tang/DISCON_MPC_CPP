@@ -1,11 +1,14 @@
 ﻿#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -50,6 +53,8 @@ namespace
         float lastTuningTraceTime = -1.0f;
         bool lastTuningTraceFallbackState = false;
         float lastCommandTraceTime = -1.0f;
+        bool mpcCommandInitialized = false;
+        float lastMpcSolveTime = 0.0f;
         bool hasOneStepPrediction = false;
         float oneStepPredictionIssuedTime = 0.0f;
         float oneStepPredictionTime = 0.0f;
@@ -125,6 +130,9 @@ namespace
     std::string gInputTracePath;
     std::string gTuningTracePath;
     std::string gCommandTracePath;
+#ifdef MPC_ENABLE_TIMING
+    std::string gTimingLogPath;
+#endif
     bool gEnableTraceFiles = true;
     bool gEnablePredictionTrace = false;
     bool gEnableInputTrace = false;
@@ -230,6 +238,8 @@ namespace
     int   gActuatorOrder = 0;
     float gPitchActuatorTau = 0.25f;
     float gTorqueActuatorTau = 0.25f;
+    float gControlDt = 0.010f;
+    bool  gEnableQpHotstart = false;
 
     constexpr int   N_STATE = 5;
     constexpr int   N_CTRL = 2;
@@ -278,6 +288,29 @@ namespace
     };
 
     SolverWorkspace gSolverWs;
+    std::unique_ptr<SQProblem> gHotstartQp;
+    bool gHotstartQpReady = false;
+    int gLastQpSolveMode = 0; // 0=cold, 1=hot, 2=hot-failed-then-cold
+    int gLastQpNwsrUsed = 0;
+
+#ifdef MPC_ENABLE_TIMING
+    using TimingClock = std::chrono::steady_clock;
+    constexpr int TIMING_VALUE_COUNT = 12;
+    std::array<double, TIMING_VALUE_COUNT> gLastTimingUs{};
+    bool gLastTimingValid = false;
+    bool gTimingLogReady = false;
+    struct TimingLogRow
+    {
+        double simulationTimeS = 0.0;
+        double demandedGenTorqueNm = 0.0;
+        double demandedPitchRad = 0.0;
+        int qpSolveMode = 0;
+        int nwsrUsed = 0;
+        std::array<double, TIMING_VALUE_COUNT> timingUs{};
+    };
+    std::vector<TimingLogRow> gTimingRows;
+    constexpr std::size_t TIMING_FLUSH_ROWS = 256;
+#endif
 
     inline std::string cArrayToString(const char* data, int n)
     {
@@ -312,6 +345,67 @@ namespace
             return path + newExt;
         return path.substr(0, dotPos) + newExt;
     }
+
+#ifdef MPC_ENABLE_TIMING
+    inline void flushTimingRows()
+    {
+        if (!gTimingLogReady || gTimingLogPath.empty() || gTimingRows.empty()) return;
+        std::ofstream out(gTimingLogPath, std::ios::app);
+        if (!out)
+        {
+            gTimingLogReady = false;
+            gTimingRows.clear();
+            return;
+        }
+        out << std::fixed << std::setprecision(6);
+        for (const auto& row : gTimingRows)
+        {
+            out << row.simulationTimeS << ','
+                << row.demandedGenTorqueNm << ','
+                << row.demandedPitchRad << ','
+                << row.qpSolveMode << ','
+                << row.nwsrUsed;
+            for (double value : row.timingUs) out << ',' << value;
+            out << '\n';
+        }
+        gTimingRows.clear();
+    }
+
+    inline bool resetTimingLog(const std::string& path)
+    {
+        gTimingRows.clear();
+        gTimingLogReady = false;
+        if (path.empty()) return false;
+
+        std::error_code removeError;
+        std::filesystem::remove(std::filesystem::path(path), removeError);
+        if (removeError) return false;
+
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        if (!out) return false;
+        out << "simulation_time_s,demanded_gen_torque_Nm,demanded_pitch_rad,qp_solve_mode,nwsr_used,"
+               "start_timestamp_us,end_timestamp_us,preprocess_us,model_workspace_us,"
+               "prediction_us,cost_us,constraints_us,qpoases_us,extract_u_us,"
+               "post_diagnostics_us,total_to_u_us,total_function_us\n";
+        out.flush();
+        gTimingLogReady = out.good();
+        return gTimingLogReady;
+    }
+
+    inline void queueTimingRow(float simulationTime, float demandedGenTorque, float demandedPitch)
+    {
+        if (!gTimingLogReady || !gLastTimingValid) return;
+        gTimingRows.push_back({
+            static_cast<double>(simulationTime),
+            static_cast<double>(demandedGenTorque),
+            static_cast<double>(demandedPitch),
+            gLastQpSolveMode,
+            gLastQpNwsrUsed,
+            gLastTimingUs
+        });
+        if (gTimingRows.size() >= TIMING_FLUSH_ROWS) flushTimingRows();
+    }
+#endif
 
     inline bool invert2x2(const MatUU& M, MatUU& Minv)
     {
@@ -951,6 +1045,8 @@ namespace
         gActuatorOrder = 0;
         gPitchActuatorTau = 0.25f;
         gTorqueActuatorTau = 0.25f;
+        gControlDt = 0.010f;
+        gEnableQpHotstart = false;
         gQTg = 1.0e-6f;
         gQBeta = 10.0f;
         gEnableTraceFiles = true;
@@ -1058,6 +1154,19 @@ namespace
             err = "Actuator time constants must be nonnegative.";
             return false;
         }
+        if (lines.size() > idx)
+        {
+            gControlDt = std::stof(lines[idx++]);
+        }
+        if (gControlDt <= 0.0f)
+        {
+            err = "CTRL_DT must be positive.";
+            return false;
+        }
+        if (lines.size() > idx)
+        {
+            gEnableQpHotstart = (std::stoi(lines[idx++]) != 0);
+        }
 
         gTable.loaded = true;
         return true;
@@ -1096,6 +1205,22 @@ namespace
         const float dt = std::max(dtController, 0.0f);
         const float alpha = 1.0f - std::exp(-dt / std::max(tau, 1.0e-6f));
         return previousApplied + alpha * (target - previousApplied);
+    }
+
+    inline float applyHardRateLimit(
+        float previousApplied,
+        float requestedApplied,
+        float maxAbsRate,
+        float dtController)
+    {
+        if (dtController <= 0.0f)
+            return previousApplied;
+        const float maxStep = std::max(maxAbsRate, 0.0f) * dtController;
+        return previousApplied + std::clamp(
+            requestedApplied - previousApplied,
+            -maxStep,
+            maxStep
+        );
     }
 
     inline float actuatorRetention(float dtController, float tau)
@@ -1959,6 +2084,21 @@ namespace
         float& demandedGenTorque,
         float& demandedPitchCmd)
     {
+#ifdef MPC_ENABLE_TIMING
+        gLastTimingUs.fill(0.0);
+        gLastTimingValid = false;
+        const auto timingStart = TimingClock::now();
+        auto timingLast = timingStart;
+        auto markTiming = [&](int index) {
+            const auto now = TimingClock::now();
+            gLastTimingUs[static_cast<std::size_t>(index)] =
+                std::chrono::duration<double, std::micro>(now - timingLast).count();
+            timingLast = now;
+            return now;
+        };
+        gLastTimingUs[0] =
+            std::chrono::duration<double, std::micro>(timingStart.time_since_epoch()).count();
+#endif
         const int nPred = gNPred;
         const int nCtrlH = gNCtrlH;
         const float dtPred = gPredictionDt;
@@ -1978,6 +2118,9 @@ namespace
         const float gFOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFomega, windRef, rotSpeedRPM) : G_FOMEGA_DEFAULT;
         const float gFBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta, windRef, rotSpeedRPM) : G_FBETA_DEFAULT;
         const float gFUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu, windRef, rotSpeedRPM) : G_FU_DEFAULT;
+#ifdef MPC_ENABLE_TIMING
+        markTiming(2); // references, preview construction, and gain-table interpolation
+#endif
 
         // Augmented state with first-order actuator memory:
         // xbar = [ dOmega, x_t, v_t, Tg_applied - Tg_ref, beta_applied - beta_ref ]^T.
@@ -2075,6 +2218,9 @@ namespace
             std::fill(gSolverWs.lbA.begin(), gSolverWs.lbA.end(), BIG_NEG);
             std::fill(gSolverWs.ubA.begin(), gSolverWs.ubA.end(), BIG_POS);
         }
+#ifdef MPC_ENABLE_TIMING
+        markTiming(3); // local model, terminal lookup, workspace allocation/reset
+#endif
 
         auto& G = gSolverWs.G;
         auto& c = gSolverWs.c;
@@ -2167,6 +2313,9 @@ namespace
                 c[p * N_STATE + i] = xnext[i];
             xpred = xnext;
         }
+#ifdef MPC_ENABLE_TIMING
+        markTiming(4); // condensed prediction G and zero-input trajectory c
+#endif
 
         MatNN stageQ = makeDiagonalQ();
 
@@ -2224,6 +2373,9 @@ namespace
                 }
             }
         }
+#ifdef MPC_ENABLE_TIMING
+        markTiming(5); // Hessian H and gradient g
+#endif
 
         // Bounds on absolute command errors
         const float dTgRatePred = VS_MAX_TQ_RATE * dtPred;
@@ -2286,24 +2438,77 @@ namespace
                 ubA[row] = static_cast<real_t>(BIG_POS);
             }
         }
+#ifdef MPC_ENABLE_TIMING
+        markTiming(6); // command bounds, slew constraints, and state constraints
+#endif
 
-        // create and solve QP
-        QProblem qp(NU, NC);
+        // Create and solve the QP. SQProblem is required for hotstarting when
+        // H and A change between control updates.
         Options options;
         options.printLevel = PL_NONE;
-        qp.setOptions(options);
-
         int_t nWSR = static_cast<int_t>(gNWSR);
-        returnValue rv = qp.init(
-            H.data(),
-            g.data(),
-            Acon.data(),
-            lb.data(),
-            ub.data(),
-            lbA.data(),
-            ubA.data(),
-            nWSR
-        );
+        returnValue rv = RET_QP_NOT_SOLVED;
+        std::unique_ptr<QProblem> coldQp;
+        QProblem* activeQp = nullptr;
+        gLastQpSolveMode = 0;
+
+        if (gEnableQpHotstart)
+        {
+            const bool dimensionsChanged =
+                !gHotstartQp || gSolverWs.nu != NU || gSolverWs.nc != NC;
+            if (dimensionsChanged)
+            {
+                gHotstartQp = std::make_unique<SQProblem>(NU, NC);
+                gHotstartQpReady = false;
+            }
+            gHotstartQp->setOptions(options);
+            activeQp = gHotstartQp.get();
+
+            if (gHotstartQpReady)
+            {
+                gLastQpSolveMode = 1;
+                rv = gHotstartQp->hotstart(
+                    H.data(), g.data(), Acon.data(),
+                    lb.data(), ub.data(), lbA.data(), ubA.data(), nWSR
+                );
+                if (rv != SUCCESSFUL_RETURN)
+                {
+                    gLastQpSolveMode = 2;
+                    gHotstartQp = std::make_unique<SQProblem>(NU, NC);
+                    gHotstartQp->setOptions(options);
+                    activeQp = gHotstartQp.get();
+                    nWSR = static_cast<int_t>(gNWSR);
+                    rv = gHotstartQp->init(
+                        H.data(), g.data(), Acon.data(),
+                        lb.data(), ub.data(), lbA.data(), ubA.data(), nWSR
+                    );
+                }
+            }
+            else
+            {
+                rv = gHotstartQp->init(
+                    H.data(), g.data(), Acon.data(),
+                    lb.data(), ub.data(), lbA.data(), ubA.data(), nWSR
+                );
+            }
+            gHotstartQpReady = (rv == SUCCESSFUL_RETURN);
+        }
+        else
+        {
+            gHotstartQp.reset();
+            gHotstartQpReady = false;
+            coldQp = std::make_unique<QProblem>(NU, NC);
+            coldQp->setOptions(options);
+            activeQp = coldQp.get();
+            rv = activeQp->init(
+                H.data(), g.data(), Acon.data(),
+                lb.data(), ub.data(), lbA.data(), ubA.data(), nWSR
+            );
+        }
+        gLastQpNwsrUsed = static_cast<int>(nWSR);
+#ifdef MPC_ENABLE_TIMING
+        markTiming(7); // qpOASES object setup and active-set solve
+#endif
         if (rv != SUCCESSFUL_RETURN)
         {
             std::ostringstream oss;
@@ -2320,7 +2525,7 @@ namespace
             return false;
         }
 
-        rv = qp.getPrimalSolution(xOpt.data());
+        rv = activeQp->getPrimalSolution(xOpt.data());
         if (rv != SUCCESSFUL_RETURN)
         {
             std::ostringstream oss;
@@ -2347,6 +2552,11 @@ namespace
         demandedPitchCmd = std::clamp(demandedPitchCmd, PC_MIN_PIT, PC_MAX_PIT);
         const float dTgApplied = demandedGenTorque - prevCommandGenTorque;
         const float dBetaApplied = demandedPitchCmd - prevCommandPitch;
+#ifdef MPC_ENABLE_TIMING
+        const auto uReadyTime = markTiming(8); // primal extraction and first command limiting
+        gLastTimingUs[10] =
+            std::chrono::duration<double, std::micro>(uReadyTime - timingStart).count();
+#endif
 
         float Jomega = 0.0f;
         float Jx = 0.0f;
@@ -2494,8 +2704,42 @@ namespace
             "qp"
         );
 
+#ifdef MPC_ENABLE_TIMING
+        const auto timingEnd = markTiming(9); // optional prediction/tuning diagnostics
+        gLastTimingUs[1] =
+            std::chrono::duration<double, std::micro>(timingEnd.time_since_epoch()).count();
+        gLastTimingUs[11] =
+            std::chrono::duration<double, std::micro>(timingEnd - timingStart).count();
+        gLastTimingValid = true;
+#endif
+
         return true;
     }
+}
+
+// Returns timestamps and the most recent successful MPC timing breakdown in microseconds.
+// Layout: start, end, preprocess, model/workspace, prediction, cost, constraints,
+// qpOASES, extract-U, post-diagnostics, total-to-U, total-function.
+DLL_EXPORT int MPC_GET_LAST_TIMING(double* values, int capacity)
+{
+#ifdef MPC_ENABLE_TIMING
+    if (values == nullptr || capacity < TIMING_VALUE_COUNT || !gLastTimingValid)
+        return 0;
+    std::copy(gLastTimingUs.begin(), gLastTimingUs.end(), values);
+    return TIMING_VALUE_COUNT;
+#else
+    (void)values;
+    (void)capacity;
+    return 0;
+#endif
+}
+
+DLL_EXPORT int MPC_GET_LAST_SOLVE_INFO(int* values, int capacity)
+{
+    if (values == nullptr || capacity < 2) return 0;
+    values[0] = gLastQpSolveMode;
+    values[1] = gLastQpNwsrUsed;
+    return 2;
 }
 
 // Minimal C++ DISCON shell.
@@ -2507,6 +2751,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 {
     if (avrSWAP == nullptr || aviFAIL == nullptr || avcMSG == nullptr)
         return;
+
+#ifdef MPC_ENABLE_TIMING
+    gLastTimingValid = false;
+#endif
 
     const int msgLen = std::max(1, static_cast<int>(std::lround(avrSWAP[48])));   // avrSWAP(49) in Fortran
     const int inFileLen = std::max(0, static_cast<int>(std::lround(avrSWAP[49]))); // avrSWAP(50)
@@ -2548,6 +2796,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.lastTuningTraceTime = -1.0f;
         gState.lastTuningTraceFallbackState = false;
         gState.lastCommandTraceTime = -1.0f;
+        gState.mpcCommandInitialized = false;
+        gState.lastMpcSolveTime = time;
         gState.hasOneStepPrediction = false;
         gState.oneStepPredictionIssuedTime = 0.0f;
         gState.oneStepPredictionTime = 0.0f;
@@ -2567,6 +2817,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gFractureStatusFromFAST = 0;
         gFractureInertiaLocked = false;
         gLidarHistory.clear();
+        gHotstartQp.reset();
+        gHotstartQpReady = false;
 
         std::string loadErr;
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
@@ -2576,6 +2828,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
         gTuningTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_tuning_trace.csv");
         gCommandTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_command_trace.csv");
+#ifdef MPC_ENABLE_TIMING
+        gTimingLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_u_timing.csv");
+        const bool timingLogReady = resetTimingLog(gTimingLogPath);
+#endif
         const bool tablesLoaded = loadGainTables(inFile, loadErr);
         bool terminalBuilt = false;
         if (tablesLoaded)
@@ -2596,11 +2852,16 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
                 << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH
                 << ", MPC_DT=" << gPredictionDt
+                << ", CTRL_DT=" << gControlDt
+                << ", QP_HOTSTART=" << (gEnableQpHotstart ? 1 : 0)
                 << ", nWSR=" << gNWSR
                 << ", terminalScale=" << gTerminalCostScale
                 << ", actuatorOrder=" << gActuatorOrder
                 << ", pitchTau=" << gPitchActuatorTau
                 << ", torqueTau=" << gTorqueActuatorTau
+#ifdef MPC_ENABLE_TIMING
+                << ", timingCsv=" << (timingLogReady ? "overwritten" : "disabled-file-busy")
+#endif
                 << ", terminalFallbackPts=" << gTerminal.fallbackPoints << ").";
             writeMessage(avcMSG, msgLen, oss.str());
         }
@@ -2720,119 +2981,165 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     }
     else
     {
-        std::string qpErr;
-        const bool qpSolved = solveMultiStepMPC(
-            time,
-            dt,
-            rotSpeed,
-            horWindV,
-            towerDispFA,
-            towerVelFA,
-            gLidar,
-            prevAppliedGenTorqueForActuator,
-            prevAppliedPitchForActuator,
-            prevTargetGenTorqueForControl,
-            prevTargetPitchForControl,
-            qpErr,
-            demandedGenTorque,
-            demandedPitch
-        );
-        qpSolvedForTrace = qpSolved;
+        // avrSWAP time is single precision; at tens of seconds its quantization
+        // is already a few microseconds. A 0.1% period tolerance prevents a
+        // nominal 10 ms update from slipping to the next 1 ms simulation step.
+        const float controlTimeTolerance = std::max(1.0e-6f, 1.0e-3f * gControlDt);
+        const bool mpcUpdateDue =
+            !gState.mpcCommandInitialized ||
+            (time - gState.lastMpcSolveTime) >= (gControlDt - controlTimeTolerance);
 
-        if (!qpSolved)
+        if (!mpcUpdateDue)
         {
-            applyScheduledTerminalFallback(
+            demandedGenTorque = gState.targetGenTorque;
+            demandedPitch = gState.targetPitchCmd;
+            gState.lastStepUsedFallback = false;
+        }
+        else
+        {
+            const float elapsedMpcTime = gState.mpcCommandInitialized
+                ? std::max(time - gState.lastMpcSolveTime, 1.0e-4f)
+                : gControlDt;
+            std::string qpErr;
+            const bool qpSolved = solveMultiStepMPC(
                 time,
-                gState.operatingWindRef,
+                elapsedMpcTime,
                 rotSpeed,
+                horWindV,
                 towerDispFA,
                 towerVelFA,
+                gLidar,
                 prevAppliedGenTorqueForActuator,
                 prevAppliedPitchForActuator,
                 prevTargetGenTorqueForControl,
                 prevTargetPitchForControl,
+                qpErr,
                 demandedGenTorque,
                 demandedPitch
             );
-            gState.lastStepUsedFallback = true;
-            fallbackUsedForTrace = true;
-            gState.fallbackCount += 1;
-            *aviFAIL = 1;
-            writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
+            qpSolvedForTrace = qpSolved;
+#ifdef MPC_ENABLE_TIMING
+            if (qpSolved) queueTimingRow(time, demandedGenTorque, demandedPitch);
+#endif
 
-            const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
-            const float betaRefNow = getPitchReference(time);
-            const std::array<float, N_STATE> z = buildAugmentedState(
-                time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, prevAppliedGenTorqueForActuator, prevAppliedPitchForActuator
-            );
-            appendTuningTraceRow(
-                gTuningTracePath,
-                time,
-                gState.fractureActive,
-                false,
-                true,
-                gState.fallbackCount,
-                gCurrentTerminalIndex,
-                rotSpeed * RPS2RPM,
-                rotSpeed,
-                towerDispFA,
-                towerVelFA,
-                horWindV,
-                0.0f,
-                tgRefNow,
-                betaRefNow,
-                prevAppliedGenTorqueForActuator,
-                prevAppliedPitchForActuator,
-                demandedGenTorque,
-                demandedPitch,
-                demandedGenTorque - prevTargetGenTorqueForControl,
-                demandedPitch - prevTargetPitchForControl,
-                z,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f,
-                gQOmega,
-                gQX,
-                gQV,
-                gQTg,
-                gQBeta,
-                gRT,
-                gRB,
-                0.0f,
-                0.0f,
-                0.0f,
-                "fallback"
-            );
-        }
-        else
-        {
-            gState.lastStepUsedFallback = false;
+            if (!qpSolved)
+            {
+                applyScheduledTerminalFallback(
+                    time,
+                    gState.operatingWindRef,
+                    rotSpeed,
+                    towerDispFA,
+                    towerVelFA,
+                    prevAppliedGenTorqueForActuator,
+                    prevAppliedPitchForActuator,
+                    prevTargetGenTorqueForControl,
+                    prevTargetPitchForControl,
+                    demandedGenTorque,
+                    demandedPitch
+                );
+                gState.lastStepUsedFallback = true;
+                fallbackUsedForTrace = true;
+                gState.fallbackCount += 1;
+                *aviFAIL = 1;
+                writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
+
+                const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
+                const float betaRefNow = getPitchReference(time);
+                const std::array<float, N_STATE> z = buildAugmentedState(
+                    time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, prevAppliedGenTorqueForActuator, prevAppliedPitchForActuator
+                );
+                appendTuningTraceRow(
+                    gTuningTracePath,
+                    time,
+                    gState.fractureActive,
+                    false,
+                    true,
+                    gState.fallbackCount,
+                    gCurrentTerminalIndex,
+                    rotSpeed * RPS2RPM,
+                    rotSpeed,
+                    towerDispFA,
+                    towerVelFA,
+                    horWindV,
+                    0.0f,
+                    tgRefNow,
+                    betaRefNow,
+                    prevAppliedGenTorqueForActuator,
+                    prevAppliedPitchForActuator,
+                    demandedGenTorque,
+                    demandedPitch,
+                    demandedGenTorque - prevTargetGenTorqueForControl,
+                    demandedPitch - prevTargetPitchForControl,
+                    z,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    gQOmega,
+                    gQX,
+                    gQV,
+                    gQTg,
+                    gQBeta,
+                    gRT,
+                    gRB,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    "fallback"
+                );
+            }
+            else
+            {
+                gState.lastStepUsedFallback = false;
+            }
+
+            gState.mpcCommandInitialized = true;
+            gState.lastMpcSolveTime = time;
         }
     }
 
     const float demandedPitchRate = std::clamp((demandedPitch - prevTargetPitchForControl) / dt, -PC_MAX_RAT, PC_MAX_RAT);
+    const float rawActuatorDt = time - gState.lastTime;
+    const float actuatorDt = (iStatus == 0 || rawActuatorDt <= 0.0f) ? 0.0f : rawActuatorDt;
     const bool actuatorLagActive = (gActuatorOrder == 1 && iStatus != 0);
+    const float requestedAppliedGenTorque = actuatorLagActive
+        ? applyFirstOrderActuator(prevAppliedGenTorqueForActuator, demandedGenTorque, actuatorDt, gTorqueActuatorTau)
+        : demandedGenTorque;
+    const float requestedAppliedPitch = actuatorLagActive
+        ? applyFirstOrderActuator(prevAppliedPitchForActuator, demandedPitch, actuatorDt, gPitchActuatorTau)
+        : demandedPitch;
     const float appliedGenTorque = std::clamp(
-        actuatorLagActive
-            ? applyFirstOrderActuator(prevAppliedGenTorqueForActuator, demandedGenTorque, dt, gTorqueActuatorTau)
-            : demandedGenTorque,
+        (iStatus == 0)
+            ? requestedAppliedGenTorque
+            : applyHardRateLimit(
+                prevAppliedGenTorqueForActuator,
+                requestedAppliedGenTorque,
+                VS_MAX_TQ_RATE,
+                actuatorDt
+            ),
         VS_MIN_TQ,
         VS_MAX_TQ
     );
     const float appliedPitch = std::clamp(
-        actuatorLagActive
-            ? applyFirstOrderActuator(prevAppliedPitchForActuator, demandedPitch, dt, gPitchActuatorTau)
-            : demandedPitch,
+        (iStatus == 0)
+            ? requestedAppliedPitch
+            : applyHardRateLimit(
+                prevAppliedPitchForActuator,
+                requestedAppliedPitch,
+                PC_MAX_RAT,
+                actuatorDt
+            ),
         PC_MIN_PIT,
         PC_MAX_PIT
     );
-    const float appliedPitchRate = std::clamp((appliedPitch - prevAppliedPitchForActuator) / dt, -PC_MAX_RAT, PC_MAX_RAT);
+    const float appliedPitchRate = (actuatorDt > 0.0f)
+        ? (appliedPitch - prevAppliedPitchForActuator) / actuatorDt
+        : 0.0f;
     const float tgRefForTrace = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
     const float betaRefForTrace = getPitchReference(time);
     appendCommandTraceRow(
@@ -2892,6 +3199,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     gState.targetGenTorque = demandedGenTorque;
     gState.targetPitchCmd = demandedPitch;
     gState.lastPitchRate = appliedPitchRate;
+
+#ifdef MPC_ENABLE_TIMING
+    if (iStatus < 0) flushTimingRows();
+#endif
 
     if (gState.fractureActive)
     {
