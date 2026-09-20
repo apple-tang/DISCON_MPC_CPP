@@ -222,16 +222,16 @@ namespace
     bool gFractureInertiaLocked = false;
 
     // Tunable MPC weights and state-constraint limits.
-    float gQOmega = 22.9f;
-    float gQX = 40.0f;
-    float gQV = 80.0f;
-    float gQTg = 1.0e-6f;
-    float gQBeta = 10.0f;
-    float gRT = 1.0e-9f;
-    float gRB = 120.0f;
-    int   gNPred = 5;
-    int   gNCtrlH = 5;
-    int   gNWSR = 200;
+    float gQOmega = 70.0f;
+    float gQX = 200.0f;
+    float gQV = 300.0f;
+    float gQTg = 1.0e-8f;
+    float gQBeta = 30.0f;
+    float gRT = 1.0e-3f;
+    float gRB = 100.0f;
+    int   gNPred = 360;
+    int   gNCtrlH = 60;
+    int   gNWSR = 500;
     float gPredictionDt = 0.000125f;
     float gTerminalCostScale = 1.0f;
     float gTerminalUnloadTriggerRpm = TERMINAL_UNLOAD_TRIGGER_RPM_DEFAULT;
@@ -1110,6 +1110,9 @@ namespace
         {
             gEnableTraceFiles = (std::stoi(lines[idx++]) != 0);
         }
+        gEnableTuningTrace = gEnableTraceFiles;
+        gEnablePredictionTrace = false;
+        gEnableInputTrace = false;
 
         if (lines.size() > idx)
         {
