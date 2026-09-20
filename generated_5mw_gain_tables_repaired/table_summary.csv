@@ -1,7 +1,0 @@
-table,definition,unit,minimum,maximum
-GTomega.csv,d(ADRtAeroMxh_[Nm])/d(d_psi_rot_[rad/s]) from C,Nm/(rad/s),-321107.667843,430082.414303
-GTbeta.csv,d(ADRtAeroMxh_[Nm])/d(PitchColl_[rad]) from D,Nm/rad,-77784.4015728,384210.108087
-GTu.csv,d(ADRtAeroMxh_[Nm])/d(WS_[m/s]) from D,Nm/(m/s),-423673.641609,955170.77829
-GFomega.csv,d(ADRtAeroFxh_[N])/d(d_psi_rot_[rad/s]) from C,N/(rad/s),-11667.4000575,15078.1543484
-GFbeta.csv,d(ADRtAeroFxh_[N])/d(PitchColl_[rad]) from D,N/rad,-7919.41075346,18474.8009423
-GFu.csv,d(ADRtAeroFxh_[N])/d(WS_[m/s]) from D,N/(m/s),-22818.0441911,51209.403845

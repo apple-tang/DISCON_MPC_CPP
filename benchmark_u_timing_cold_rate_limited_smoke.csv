@@ -1,4 +1,0 @@
-qp_solve_mode,nwsr_used,start_timestamp_us,end_timestamp_us,preprocess_us,model_workspace_us,prediction_us,cost_us,constraints_us,qpoases_us,extract_u_us,post_diagnostics_us,total_to_u_us,total_function_us
-0,334,108272420671.9,108272591295.0,3.1,56.3,274.9,14535.5,28.1,155643.9,0.3,81.0,170542.1,170623.1
-0,334,108272591489.8,108272762724.5,2.2,49.4,248.8,13264.8,32.8,157559.5,0.3,76.9,171157.8,171234.7
-0,334,108272762888.1,108272931937.1,2.0,47.2,251.7,14041.1,26.6,154606.5,0.2,73.7,168975.3,169049.0

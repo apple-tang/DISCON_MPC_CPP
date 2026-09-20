@@ -1,1 +1,0 @@
-simulation_time_s,demanded_gen_torque_Nm,demanded_pitch_rad,qp_solve_mode,nwsr_used,start_timestamp_us,end_timestamp_us,preprocess_us,model_workspace_us,prediction_us,cost_us,constraints_us,qpoases_us,extract_u_us,post_diagnostics_us,total_to_u_us,total_function_us

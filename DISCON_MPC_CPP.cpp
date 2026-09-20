@@ -1,9 +1,10 @@
-﻿#include <algorithm>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <deque>
+#include <map>
+#include <stdexcept>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -40,7 +41,7 @@ namespace
         float intSpdErr = 0.0f;
         float lastTimeVS = 0.0f;
         float lastTimePC = 0.0f;
-        float lastLidarLogTime = -1.0f;
+        float lastDebugLogTime = -1.0f;
         int fallbackCount = 0;
         bool lastStepUsedFallback = false;
         float VS_Slope15 = 0.0f;
@@ -50,8 +51,6 @@ namespace
         bool operatingWindRefInitialized = false;
         float operatingWindRef = 0.0f;
         int turbulentWindBand = -1;
-        float lastTuningTraceTime = -1.0f;
-        bool lastTuningTraceFallbackState = false;
         float lastCommandTraceTime = -1.0f;
         bool mpcCommandInitialized = false;
         float lastMpcSolveTime = 0.0f;
@@ -78,68 +77,17 @@ namespace
         std::vector<std::vector<float>> GFu;
     };
 
-    struct ReferenceCurveTableData
-    {
-        bool loaded = false;
-        std::vector<float> windPtsMs;
-        std::vector<float> tgHiKnm;
-        std::vector<float> omegaHiRpm;
-        std::vector<float> omegaLoRpm;
-        std::vector<float> shapeP;
-    };
-
-    struct ShutdownReferenceTrajectoryData
-    {
-        bool loaded = false;
-        std::vector<float> timeS;
-        std::vector<float> omegaRefRpm;
-        std::vector<float> betaRefDeg;
-        std::vector<float> tgRefKnm;
-    };
-
-    struct LidarPreviewData
-    {
-        bool available = false;
-        int sensorType = 0;
-        int numBeams = 0;
-        int numPulseGates = 0;
-        float referenceWind = 0.0f;
-        std::vector<float> measuredSpeeds;
-        std::vector<float> posX;
-        std::vector<float> posY;
-        std::vector<float> posZ;
-    };
-
-    struct LidarHistoryPoint
-    {
-        float tMeas = 0.0f;
-        float convectionWind = 0.0f;
-        float measuredSpeed = 0.0f;
-        float posX = 0.0f;
-    };
-
     ControllerState gState;
     GainTableData gTable;
-    ReferenceCurveTableData gRefCurve;
-    ShutdownReferenceTrajectoryData gShutdownRef;
-    LidarPreviewData gLidar;
-    std::deque<LidarHistoryPoint> gLidarHistory;
     float gFractureTime = 30.0f;
     std::string gDebugLogPath;
-    std::string gPredictionLogPath;
-    std::string gInputTracePath;
-    std::string gTuningTracePath;
     std::string gCommandTracePath;
 #ifdef MPC_ENABLE_TIMING
     std::string gTimingLogPath;
 #endif
-    bool gEnableTraceFiles = true;
-    bool gEnablePredictionTrace = false;
-    bool gEnableInputTrace = false;
-    bool gEnableTuningTrace = false;
+    bool gEnableTraceFiles = false;
     int gCurrentTerminalIndex = -1;
 
-    constexpr float D2R = 0.017453292f;
     constexpr float R2D = 57.295780f;
     constexpr float RPS2RPM = 9.5492966f;
     constexpr float PC_MAX_PIT = 1.570796f;
@@ -176,12 +124,10 @@ namespace
     constexpr float J_generator = 534.116f;    // Generator inertia about HSS (kg m^2)
 
     constexpr float N_gear = 97.0f;            // gearbox ratio
-    constexpr float J_EQ_DEFAULT = J_RF_DEFAULT + J_generator * N_gear * N_gear; // 等效转动惯量 fallback
+    constexpr float J_EQ_DEFAULT = J_RF_DEFAULT + J_generator * N_gear * N_gear; // equivalent inertia fallback
     constexpr float M_T = 3.822772e5f;        // kg
     constexpr float C_T = 6.858330e3f;        // N s/m
     constexpr float K_T = 1.184008e6f;        // N/m
-    constexpr float OMEGA_T = 1.759900f;       // rad/s
-    constexpr float ZETA_T = 5.097086e-3f;    // -
     constexpr float G_TOMEGA_DEFAULT = 0.0f;   // fallback until tables are loaded
     constexpr float G_FOMEGA_DEFAULT = 0.0f;
     constexpr float G_TBETA_DEFAULT = -2.0e6f;
@@ -193,14 +139,8 @@ namespace
     constexpr int   FRACTURE_LOCATION_IDX = 1024;       // C index for avrSWAP(1025)
     constexpr int   FRACTURE_SIGMA_IDX = 1025;          // C index for avrSWAP(1026)
     constexpr int   FRACTURE_STATUS_IDX = 1026;         // C index for avrSWAP(1027): 0 inactive, 1 ramping, 2 final
-    constexpr int   LIDAR_MSR_START = 2000;  // C index for avrSWAP(2001)
-    constexpr int   LIDAR_MAX_CHAN  = 500;
-    constexpr float LIDAR_LOG_DT = 0.1f;     // seconds between lidar debug log entries
-    constexpr float LIDAR_MIN_CONV_WIND = 1.0f;   // minimum convection speed used in Taylor mapping [m/s]
-    constexpr float LIDAR_EVOLUTION_LENGTH = 300.0f; // decay length for preview confidence [m]
-    constexpr float LIDAR_HISTORY_MAX_AGE = 30.0f;   // seconds of lidar history kept for preview mapping
+    constexpr float DEBUG_LOG_DT = 0.1f;     // seconds between debug log entries
     constexpr float OPERATING_WIND_REF_TAU = 1.0f / 1.570796f; // matched to baseline DISCON CornerFreq [s]
-    constexpr float TUNING_TRACE_DT = 0.5f;          // seconds between ordinary tuning-trace rows
     constexpr float COMMAND_TRACE_DT = 0.01f;        // dataset-aligned command-trace sampling interval [s]
     constexpr float TURB_WIND_BAND_HYST = 0.5f;      // [m/s] hysteresis on filtered mean wind band switching
     constexpr float TURB_WIND_BAND_0_MAX = 9.0f;     // 8 m/s anchor
@@ -222,22 +162,19 @@ namespace
     bool gFractureInertiaLocked = false;
 
     // Tunable MPC weights and state-constraint limits.
-    float gQOmega = 70.0f;
+    float gQOmega = 30.0f;
     float gQX = 200.0f;
-    float gQV = 300.0f;
-    float gQTg = 1.0e-8f;
-    float gQBeta = 30.0f;
-    float gRT = 1.0e-3f;
-    float gRB = 100.0f;
-    int   gNPred = 360;
-    int   gNCtrlH = 60;
+    float gQV = 200.0f;
+    float gQTg = 1.0e-6f;
+    float gQBeta = 400.0f;
+    float gRT = 5.0f;
+    float gRB = 60.0f;
+    int   gNPred = 330;
+    int   gNCtrlH = 70;
     int   gNWSR = 500;
-    float gPredictionDt = 0.000125f;
-    float gTerminalCostScale = 1.0f;
-    float gTerminalUnloadTriggerRpm = TERMINAL_UNLOAD_TRIGGER_RPM_DEFAULT;
-    int   gActuatorOrder = 0;
-    float gPitchActuatorTau = 0.25f;
-    float gTorqueActuatorTau = 0.25f;
+    float gPredictionDt = 0.010f;
+    constexpr float gTerminalCostScale = 0.0f;
+    constexpr float gTerminalUnloadTriggerRpm = TERMINAL_UNLOAD_TRIGGER_RPM_DEFAULT;
     float gControlDt = 0.010f;
     bool  gEnableQpHotstart = false;
 
@@ -254,7 +191,6 @@ namespace
     inline float getGeneratorTorqueReference(float time, float rotSpeed, float windNow);
     inline float getRotorSpeedReference(float time);
     inline float getPitchReference(float time);
-    inline float actuatorRetention(float dtController, float tau);
 
     struct TerminalScheduleData
     {
@@ -284,7 +220,6 @@ namespace
         std::vector<real_t> ubA;
         std::vector<real_t> xOpt;
         std::vector<float> WG;
-        std::vector<MatNN> powers;
     };
 
     SolverWorkspace gSolverWs;
@@ -466,10 +401,10 @@ namespace
 
         for (int iter = 0; iter < 500; ++iter)
         {
+            MatUN BtP{};
             MatUN BtPA{};
             MatUU BtPB{};
             MatNN AtPA{};
-            MatNN AtPBK{};
             MatUN Knew{};
             MatNN Pnext{};
 
@@ -480,7 +415,7 @@ namespace
                     float acc = 0.0f;
                     for (int k = 0; k < N_STATE; ++k)
                         acc += B[k * N_CTRL + i] * P[k * N_STATE + j];
-                    BtPA[i * N_STATE + j] = acc;
+                    BtP[i * N_STATE + j] = acc;
                 }
             }
 
@@ -490,7 +425,7 @@ namespace
                 {
                     float acc = 0.0f;
                     for (int k = 0; k < N_STATE; ++k)
-                        acc += BtPA[i * N_STATE + k] * B[k * N_CTRL + j];
+                        acc += BtP[i * N_STATE + k] * B[k * N_CTRL + j];
                     BtPB[i * N_CTRL + j] = acc + R[i * N_CTRL + j];
                 }
             }
@@ -501,7 +436,7 @@ namespace
                 {
                     float acc = 0.0f;
                     for (int k = 0; k < N_STATE; ++k)
-                        acc += BtPA[i * N_STATE + k] * A[k * N_STATE + j];
+                        acc += BtP[i * N_STATE + k] * A[k * N_STATE + j];
                     BtPA[i * N_STATE + j] = acc;
                 }
             }
@@ -566,7 +501,10 @@ namespace
 
             float maxDiff = 0.0f;
             for (int i = 0; i < N_STATE * N_STATE; ++i)
+            {
+                if (!std::isfinite(Pnext[i])) return false;
                 maxDiff = std::max(maxDiff, std::fabs(Pnext[i] - P[i]));
+            }
 
             P = Pnext;
             K = Knew;
@@ -614,8 +552,8 @@ namespace
                 const float b11 = -dt * N_gear / gJEQRuntime;
                 const float b12 = dt * gTBetaNow / gJEQRuntime;
                 const float b32 = dt * gFBetaNow / M_T;
-                const float tgRetain = actuatorRetention(dt, gTorqueActuatorTau);
-                const float betaRetain = actuatorRetention(dt, gPitchActuatorTau);
+                const float tgRetain = 0.0f;
+                const float betaRetain = 0.0f;
                 const float tgCmdGain = 1.0f - tgRetain;
                 const float betaCmdGain = 1.0f - betaRetain;
 
@@ -823,356 +761,158 @@ namespace
 
     inline std::string stripComment(const std::string& s)
     {
-        const auto p = s.find('!');
+        const auto p = s.find_first_of("!#");
         return (p == std::string::npos) ? s : s.substr(0, p);
+    }
+
+    inline float parseFiniteFloat(const std::string& token)
+    {
+        const std::string value = trim(token);
+        std::size_t used = 0;
+        const float parsed = std::stof(value, &used);
+        if (used != value.size() || !std::isfinite(parsed))
+            throw std::runtime_error("Expected a finite number: " + value);
+        return parsed;
     }
 
     inline std::vector<float> splitCsvLine(const std::string& line)
     {
-        std::vector<float> vals;
-        std::stringstream ss(line);
-        std::string item;
-        while (std::getline(ss, item, ','))
-        {
-            item = trim(item);
-            if (!item.empty())
-                vals.push_back(std::stof(item));
-        }
-        return vals;
+        std::vector<float> values;
+        std::stringstream stream(line);
+        std::string token;
+        if (trim(line).empty() || trim(line).back() == ',')
+            throw std::runtime_error("Empty CSV value.");
+        while (std::getline(stream, token, ','))
+            values.push_back(parseFiniteFloat(token));
+        return values;
     }
 
-    inline bool loadCsvTable(const std::string& path, int nWind, int nSpeed, std::vector<std::vector<float>>& table)
+    inline bool loadCsvTable(const std::string& path, int nWind, int nSpeed,
+        std::vector<std::vector<float>>& table)
     {
         std::ifstream in(path);
         if (!in) return false;
-        table.assign(nWind, std::vector<float>(nSpeed, 0.0f));
+        table.clear();
         std::string line;
-        int row = 0;
-        while (std::getline(in, line) && row < nWind)
-        {
-            line = trim(stripComment(line));
-            if (line.empty()) continue;
-            const auto vals = splitCsvLine(line);
-            if (static_cast<int>(vals.size()) < nSpeed) return false;
-            for (int j = 0; j < nSpeed; ++j) table[row][j] = vals[j];
-            ++row;
-        }
-        return row == nWind;
-    }
-
-    inline bool loadReferenceCurveTable(const std::string& path)
-    {
-        std::ifstream in(path);
-        if (!in) return false;
-
-        ReferenceCurveTableData table{};
-        std::string line;
-        bool firstRow = true;
         while (std::getline(in, line))
         {
             line = trim(stripComment(line));
             if (line.empty()) continue;
-
-            if (firstRow)
-            {
-                firstRow = false;
-                continue;
-            }
-
-            std::stringstream ss(line);
-            std::string item;
-            std::vector<std::string> fields;
-            while (std::getline(ss, item, ','))
-                fields.push_back(trim(item));
-
-            if (fields.size() < 5) return false;
-            table.windPtsMs.push_back(std::stof(fields[0]));
-            table.tgHiKnm.push_back(std::stof(fields[1]));
-            table.omegaHiRpm.push_back(std::stof(fields[2]));
-            table.omegaLoRpm.push_back(std::stof(fields[3]));
-            table.shapeP.push_back(std::stof(fields[4]));
+            auto values = splitCsvLine(line);
+            if (static_cast<int>(values.size()) != nSpeed ||
+                static_cast<int>(table.size()) >= nWind)
+                return false;
+            table.push_back(std::move(values));
         }
-
-        if (table.windPtsMs.empty()) return false;
-
-        std::vector<std::size_t> order(table.windPtsMs.size());
-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-            return table.windPtsMs[a] < table.windPtsMs[b];
-            });
-
-        ReferenceCurveTableData sorted{};
-        sorted.loaded = true;
-        for (std::size_t idx : order)
-        {
-            sorted.windPtsMs.push_back(table.windPtsMs[idx]);
-            sorted.tgHiKnm.push_back(table.tgHiKnm[idx]);
-            sorted.omegaHiRpm.push_back(table.omegaHiRpm[idx]);
-            sorted.omegaLoRpm.push_back(table.omegaLoRpm[idx]);
-            sorted.shapeP.push_back(table.shapeP[idx]);
-        }
-
-        gRefCurve = std::move(sorted);
-        return true;
-    }
-
-    inline bool loadShutdownReferenceTrajectory(const std::string& path)
-    {
-        std::ifstream in(path);
-        if (!in) return false;
-
-        ShutdownReferenceTrajectoryData table{};
-        std::string line;
-        bool firstRow = true;
-        while (std::getline(in, line))
-        {
-            line = trim(stripComment(line));
-            if (line.empty()) continue;
-
-            if (firstRow)
-            {
-                firstRow = false;
-                continue;
-            }
-
-            std::stringstream ss(line);
-            std::string item;
-            std::vector<std::string> fields;
-            while (std::getline(ss, item, ','))
-                fields.push_back(trim(item));
-
-            if (fields.size() < 4) return false;
-            table.timeS.push_back(std::stof(fields[0]));
-            table.omegaRefRpm.push_back(std::stof(fields[1]));
-            table.betaRefDeg.push_back(std::stof(fields[2]));
-            table.tgRefKnm.push_back(std::stof(fields[3]));
-        }
-
-        if (table.timeS.empty()) return false;
-
-        std::vector<std::size_t> order(table.timeS.size());
-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-            return table.timeS[a] < table.timeS[b];
-            });
-
-        ShutdownReferenceTrajectoryData sorted{};
-        sorted.loaded = true;
-        for (std::size_t idx : order)
-        {
-            sorted.timeS.push_back(table.timeS[idx]);
-            sorted.omegaRefRpm.push_back(table.omegaRefRpm[idx]);
-            sorted.betaRefDeg.push_back(table.betaRefDeg[idx]);
-            sorted.tgRefKnm.push_back(table.tgRefKnm[idx]);
-        }
-
-        gShutdownRef = std::move(sorted);
-        return true;
+        return static_cast<int>(table.size()) == nWind;
     }
 
     inline bool loadGainTables(const std::string& inFilePath, std::string& err)
     {
-        std::ifstream in(inFilePath);
-        if (!in)
+        gTable = {};
+        try
         {
-            err = "Could not open MPC gain-table config file.";
+            std::ifstream in(inFilePath);
+            if (!in) throw std::runtime_error("Cannot open controller input file: " + inFilePath);
+            std::map<std::string, std::string> settings;
+            const std::array<const char*, 13> keys = {
+                "FRACTURE_TIME", "MPC_DT", "CTRL_DT", "N_PRED", "N_CTRL",
+                "Q", "R", "NWSR", "QP_START", "DEBUG", "TABLE_DIR",
+                "SPEED_POINTS_RPM", "WIND_POINTS_MS"
+            };
+            std::string line;
+            int lineNumber = 0;
+            while (std::getline(in, line))
+            {
+                ++lineNumber;
+                line = trim(stripComment(line));
+                if (line.empty()) continue;
+                const auto separator = line.find('=');
+                if (separator == std::string::npos)
+                    throw std::runtime_error("Expected KEY = VALUE on line " +
+                        std::to_string(lineNumber) + "; legacy positional IN files are not supported.");
+                const std::string key = trim(line.substr(0, separator));
+                const std::string value = trim(line.substr(separator + 1));
+                if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                    throw std::runtime_error("Unknown setting: " + key);
+                if (value.empty() || !settings.emplace(key, value).second)
+                    throw std::runtime_error("Empty or duplicate setting: " + key);
+            }
+            for (const auto key : keys)
+                if (!settings.count(key)) throw std::runtime_error(std::string("Missing setting: ") + key);
+
+            auto number = [&](const char* key) { return parseFiniteFloat(settings.at(key)); };
+            auto integer = [&](const char* key, int maximum) {
+                const float value = number(key);
+                if (value < 1.0f || value > maximum || value != std::floor(value))
+                    throw std::runtime_error(std::string(key) + " must be an integer in [1, " +
+                        std::to_string(maximum) + "].");
+                return static_cast<int>(value);
+            };
+            gFractureTime = number("FRACTURE_TIME");
+            gPredictionDt = number("MPC_DT");
+            gControlDt = number("CTRL_DT");
+            if (gFractureTime < 0.0f || gPredictionDt <= 0.0f || gControlDt <= 0.0f)
+                throw std::runtime_error("FRACTURE_TIME must be nonnegative; MPC_DT and CTRL_DT must be positive.");
+            gNPred = integer("N_PRED", 2000);
+            gNCtrlH = integer("N_CTRL", 500);
+            gNWSR = integer("NWSR", 1000000);
+            if (gNCtrlH > gNPred) throw std::runtime_error("N_CTRL must not exceed N_PRED.");
+
+            const auto q = splitCsvLine(settings.at("Q"));
+            const auto r = splitCsvLine(settings.at("R"));
+            if (q.size() != 5 || r.size() != 2)
+                throw std::runtime_error("Q needs five weights; R needs two weights.");
+            for (float value : q)
+                if (value < 0.0f) throw std::runtime_error("Q weights must be nonnegative.");
+            for (float value : r)
+                if (value <= 0.0f) throw std::runtime_error("R weights must be positive.");
+            gQOmega = q[0]; gQX = q[1]; gQV = q[2]; gQTg = q[3]; gQBeta = q[4];
+            gRT = r[0]; gRB = r[1];
+
+            const auto& start = settings.at("QP_START");
+            if (start != "cold" && start != "warm")
+                throw std::runtime_error("QP_START must be cold or warm.");
+            gEnableQpHotstart = (start == "warm");
+            const auto& debug = settings.at("DEBUG");
+            if (debug != "0" && debug != "1")
+                throw std::runtime_error("DEBUG must be 0 or 1.");
+            gEnableTraceFiles = (debug == "1");
+
+            gTable.speedPtsRpm = splitCsvLine(settings.at("SPEED_POINTS_RPM"));
+            gTable.windPtsMs = splitCsvLine(settings.at("WIND_POINTS_MS"));
+            auto checkGrid = [](const std::vector<float>& grid) {
+                if (grid.size() < 2 || grid.size() > 2000 || grid.front() < 0.0f)
+                    throw std::runtime_error("Each gain grid needs 2..2000 nonnegative points.");
+                for (std::size_t i = 1; i < grid.size(); ++i)
+                    if (grid[i] <= grid[i - 1])
+                        throw std::runtime_error("Gain-grid points must be strictly increasing.");
+            };
+            checkGrid(gTable.speedPtsRpm);
+            checkGrid(gTable.windPtsMs);
+            const auto nSpeed = static_cast<int>(gTable.speedPtsRpm.size());
+            const auto nWind = static_cast<int>(gTable.windPtsMs.size());
+            const auto tableDir = std::filesystem::path(inFilePath).parent_path() /
+                std::filesystem::path(settings.at("TABLE_DIR"));
+            const std::array<const char*, 6> files = {
+                "GTomega.csv", "GTbeta.csv", "GTu.csv", "GFomega.csv", "GFbeta.csv", "GFu.csv"
+            };
+            const std::array<std::vector<std::vector<float>>*, 6> tables = {
+                &gTable.GTomega, &gTable.GTbeta, &gTable.GTu,
+                &gTable.GFomega, &gTable.GFbeta, &gTable.GFu
+            };
+            for (std::size_t i = 0; i < files.size(); ++i)
+                if (!loadCsvTable((tableDir / files[i]).string(), nWind, nSpeed, *tables[i]))
+                    throw std::runtime_error(std::string("Missing or incorrectly sized table: ") + files[i]);
+            gTable.loaded = true;
+            return true;
+        }
+        catch (const std::exception& exception)
+        {
+            gTable = {};
+            err = std::string("Invalid MPC configuration: ") + exception.what();
             return false;
         }
-
-        std::vector<std::string> lines;
-        std::string line;
-        while (std::getline(in, line))
-        {
-            line = trim(stripComment(line));
-            if (!line.empty()) lines.push_back(line);
-        }
-
-        if (lines.size() < 10)
-        {
-            err = "MPC gain-table config file has too few non-empty lines.";
-            return false;
-        }
-
-        const int nSpeed = std::stoi(lines[0]);
-        const int nWind = std::stoi(lines[1]);
-        gTable.speedPtsRpm = splitCsvLine(lines[2]);
-        gTable.windPtsMs = splitCsvLine(lines[3]);
-
-        if (static_cast<int>(gTable.speedPtsRpm.size()) != nSpeed || static_cast<int>(gTable.windPtsMs.size()) != nWind)
-        {
-            err = "Speed/wind point counts do not match config.";
-            return false;
-        }
-
-        std::string dir = inFilePath;
-        const auto pos = dir.find_last_of("\\/");
-        dir = (pos == std::string::npos) ? "." : dir.substr(0, pos);
-        auto makePath = [&](const std::string& file) { return dir + "/" + trim(file); };
-
-        if (!loadCsvTable(makePath(lines[4]), nWind, nSpeed, gTable.GTomega)) { err = "Failed loading GTomega table."; return false; }
-        if (!loadCsvTable(makePath(lines[5]), nWind, nSpeed, gTable.GTbeta)) { err = "Failed loading GTbeta table.";  return false; }
-        if (!loadCsvTable(makePath(lines[6]), nWind, nSpeed, gTable.GTu)) { err = "Failed loading GTu table.";     return false; }
-        if (!loadCsvTable(makePath(lines[7]), nWind, nSpeed, gTable.GFomega)) { err = "Failed loading GFomega table."; return false; }
-        if (!loadCsvTable(makePath(lines[8]), nWind, nSpeed, gTable.GFbeta)) { err = "Failed loading GFbeta table.";  return false; }
-        if (!loadCsvTable(makePath(lines[9]), nWind, nSpeed, gTable.GFu)) { err = "Failed loading GFu table.";     return false; }
-        gRefCurve = {};
-        if (!loadReferenceCurveTable(makePath("TgRefCurveTable_runtime.csv")))
-            loadReferenceCurveTable(makePath("TgRefCurveTable.csv"));
-
-        // The paper-study path keeps fixed post-fracture references.
-        // Time-varying shutdown trajectories remain disabled unless they are
-        // explicitly re-enabled in code.
-        gShutdownRef = {};
-
-        if (lines.size() >= 11) gFractureTime = std::stof(lines[10]);
-
-        // Backward-compatible parsing:
-        // old format:  19 data lines, horizons fixed at 5/5 in code
-        // mid format:  21 data lines, lines[11:12] are N_PRED/N_CTRL_H
-        // new format:  23 data lines, adds Q_TG and Q_BETA before R_T/R_B
-        // legacy newest format: 27 data lines, lines 21:23 are unused hard limits,
-        // line 24 is MPC_DT, line 25 toggles trace-file generation,
-        // line 26 sets the qpOASES nWSR iteration budget, and line 27 scales the terminal cost
-        // current format: 25+ data lines, line 12 is TERMINAL_UNLOAD_OMEGA_RPM and the unused hard limits are removed
-        const bool hasTerminalUnloadLine =
-            (lines.size() >= 25 && std::fabs(std::stof(lines[11]) - std::round(std::stof(lines[11]))) > 1.0e-6f);
-        std::size_t idx = 11;
-        gNPred = 5;
-        gNCtrlH = 5;
-        gNWSR = 200;
-        gPredictionDt = 0.000125f;
-        gTerminalCostScale = 1.0f;
-        gActuatorOrder = 0;
-        gPitchActuatorTau = 0.25f;
-        gTorqueActuatorTau = 0.25f;
-        gControlDt = 0.010f;
-        gEnableQpHotstart = false;
-        gQTg = 1.0e-6f;
-        gQBeta = 10.0f;
-        gEnableTraceFiles = true;
-        gTerminalUnloadTriggerRpm = TERMINAL_UNLOAD_TRIGGER_RPM_DEFAULT;
-        if (hasTerminalUnloadLine && lines.size() > idx)
-            gTerminalUnloadTriggerRpm = std::stof(lines[idx++]);
-
-        if (lines.size() >= idx + 2)
-        {
-            gNPred = std::stoi(lines[idx++]);
-            gNCtrlH = std::stoi(lines[idx++]);
-        }
-
-        if (gNPred < 1)
-        {
-            err = "N_PRED must be at least 1.";
-            return false;
-        }
-        if (gNCtrlH < 1)
-        {
-            err = "N_CTRL_H must be at least 1.";
-            return false;
-        }
-        if (gNCtrlH > gNPred)
-        {
-            err = "N_CTRL_H must be less than or equal to N_PRED.";
-            return false;
-        }
-
-        if (lines.size() >= idx + 7)
-        {
-            if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQX = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQV = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQTg = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQBeta = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRT = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRB = std::stof(lines[idx++]);
-        }
-        else
-        {
-            if (lines.size() > idx) gQOmega = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQX = std::stof(lines[idx++]);
-            if (lines.size() > idx) gQV = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRT = std::stof(lines[idx++]);
-            if (lines.size() > idx) gRB = std::stof(lines[idx++]);
-        }
-
-        if (lines.size() > idx)
-        {
-            gPredictionDt = std::stof(lines[idx++]);
-        }
-
-        if (gPredictionDt <= 0.0f)
-        {
-            err = "MPC_DT must be positive.";
-            return false;
-        }
-
-        if (lines.size() > idx)
-        {
-            gEnableTraceFiles = (std::stoi(lines[idx++]) != 0);
-        }
-        gEnableTuningTrace = gEnableTraceFiles;
-        gEnablePredictionTrace = false;
-        gEnableInputTrace = false;
-
-        if (lines.size() > idx)
-        {
-            gNWSR = std::stoi(lines[idx++]);
-        }
-
-        if (gNWSR < 1)
-        {
-            err = "nWSR must be at least 1.";
-            return false;
-        }
-
-        if (lines.size() > idx)
-        {
-            gTerminalCostScale = std::stof(lines[idx++]);
-        }
-        if (gTerminalCostScale < 0.0f)
-        {
-            err = "TERMINAL_COST_SCALE must be nonnegative.";
-            return false;
-        }
-
-        if (lines.size() > idx)
-        {
-            gActuatorOrder = std::stoi(lines[idx++]);
-        }
-        if (lines.size() > idx)
-        {
-            gPitchActuatorTau = std::stof(lines[idx++]);
-        }
-        if (lines.size() > idx)
-        {
-            gTorqueActuatorTau = std::stof(lines[idx++]);
-        }
-        if (gActuatorOrder != 0 && gActuatorOrder != 1)
-        {
-            err = "ACTUATOR_ORDER must be 0 or 1.";
-            return false;
-        }
-        if (gPitchActuatorTau < 0.0f || gTorqueActuatorTau < 0.0f)
-        {
-            err = "Actuator time constants must be nonnegative.";
-            return false;
-        }
-        if (lines.size() > idx)
-        {
-            gControlDt = std::stof(lines[idx++]);
-        }
-        if (gControlDt <= 0.0f)
-        {
-            err = "CTRL_DT must be positive.";
-            return false;
-        }
-        if (lines.size() > idx)
-        {
-            gEnableQpHotstart = (std::stoi(lines[idx++]) != 0);
-        }
-
-        gTable.loaded = true;
-        return true;
     }
 
     inline float clampToRange(float x, float lo, float hi)
@@ -1200,16 +940,6 @@ namespace
         return gState.operatingWindRef;
     }
 
-    inline float applyFirstOrderActuator(float previousApplied, float target, float dtController, float tau)
-    {
-        if (gActuatorOrder == 0 || tau <= 0.0f)
-            return target;
-
-        const float dt = std::max(dtController, 0.0f);
-        const float alpha = 1.0f - std::exp(-dt / std::max(tau, 1.0e-6f));
-        return previousApplied + alpha * (target - previousApplied);
-    }
-
     inline float applyHardRateLimit(
         float previousApplied,
         float requestedApplied,
@@ -1224,14 +954,6 @@ namespace
             -maxStep,
             maxStep
         );
-    }
-
-    inline float actuatorRetention(float dtController, float tau)
-    {
-        if (gActuatorOrder == 0 || tau <= 0.0f)
-            return 0.0f;
-        const float dt = std::max(dtController, 0.0f);
-        return std::exp(-dt / std::max(tau, 1.0e-6f));
     }
 
     inline int classifyTurbulentWindBand(float windRef)
@@ -1288,121 +1010,6 @@ namespace
         }
     }
 
-    inline void readLidarPreviewData(const float* avrSWAP, LidarPreviewData& lidar)
-    {
-        lidar = {};
-        if (avrSWAP == nullptr) return;
-
-        const int sensorType = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 0]));
-        const int numBeams = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 1]));
-        const int numPulseGates = static_cast<int>(std::lround(avrSWAP[LIDAR_MSR_START + 2]));
-        const int nPts = numBeams * numPulseGates;
-        if (sensorType == 0 || nPts <= 0) return;
-
-        const int dataStart = LIDAR_MSR_START + 4;
-        const int maxPts = (LIDAR_MAX_CHAN - 4) / 4;
-        const int usedPts = std::min(nPts, maxPts);
-
-        lidar.available = true;
-        lidar.sensorType = sensorType;
-        lidar.numBeams = numBeams;
-        lidar.numPulseGates = numPulseGates;
-        lidar.referenceWind = avrSWAP[LIDAR_MSR_START + 3];
-        lidar.measuredSpeeds.resize(static_cast<std::size_t>(usedPts));
-        lidar.posX.resize(static_cast<std::size_t>(usedPts));
-        lidar.posY.resize(static_cast<std::size_t>(usedPts));
-        lidar.posZ.resize(static_cast<std::size_t>(usedPts));
-
-        for (int i = 0; i < usedPts; ++i)
-        {
-            lidar.measuredSpeeds[static_cast<std::size_t>(i)] = avrSWAP[dataStart + i];
-            lidar.posX[static_cast<std::size_t>(i)] = avrSWAP[dataStart + usedPts + i];
-            lidar.posY[static_cast<std::size_t>(i)] = avrSWAP[dataStart + 2 * usedPts + i];
-            lidar.posZ[static_cast<std::size_t>(i)] = avrSWAP[dataStart + 3 * usedPts + i];
-        }
-    }
-
-    inline void updateLidarHistory(
-        float time,
-        float currentWind,
-        const LidarPreviewData& lidar)
-    {
-        while (!gLidarHistory.empty() && (time - gLidarHistory.front().tMeas) > LIDAR_HISTORY_MAX_AGE)
-            gLidarHistory.pop_front();
-
-        if (!lidar.available || lidar.measuredSpeeds.empty()) return;
-
-        const float convectionWind = std::max(std::fabs(currentWind), LIDAR_MIN_CONV_WIND);
-        for (std::size_t i = 0; i < lidar.measuredSpeeds.size(); ++i)
-        {
-            LidarHistoryPoint point;
-            point.tMeas = time;
-            point.convectionWind = convectionWind;
-            point.measuredSpeed = lidar.measuredSpeeds[i];
-            point.posX = (i < lidar.posX.size()) ? lidar.posX[i] : 0.0f;
-            gLidarHistory.push_back(point);
-        }
-    }
-
-    inline std::vector<float> buildWindPreviewDeltas(
-        float currentTime,
-        float currentWind,
-        int nPred,
-        float dtPred,
-        bool& usedLidarHistory)
-    {
-        std::vector<float> dWindPreview(static_cast<std::size_t>(std::max(nPred, 0)), 0.0f);
-        usedLidarHistory = false;
-        if (nPred <= 0 || dtPred <= 0.0f || gLidarHistory.empty()) return dWindPreview;
-
-        std::vector<float> weightSum(static_cast<std::size_t>(nPred), 0.0f);
-
-        for (const auto& pt : gLidarHistory)
-        {
-            const float xPos = pt.posX;
-            const float distanceAhead = std::max(0.0f, -xPos);
-            const float convectionWind = std::max(std::fabs(pt.convectionWind), LIDAR_MIN_CONV_WIND);
-            const float tArrive = pt.tMeas + distanceAhead / convectionWind;
-            const float futureTime = tArrive - currentTime;
-            if (futureTime < 0.0f) continue;
-
-            const int stepOffset = static_cast<int>(std::lround(futureTime / dtPred));
-            if (stepOffset < 0) continue;
-            const int p = std::min(stepOffset, std::max(nPred - 1, 0));
-            const float decay = std::exp(-distanceAhead / LIDAR_EVOLUTION_LENGTH);
-            const float delta = decay * (pt.measuredSpeed - currentWind);
-            dWindPreview[static_cast<std::size_t>(p)] += delta;
-            weightSum[static_cast<std::size_t>(p)] += decay;
-        }
-
-        float lastValid = 0.0f;
-        bool anyAssigned = false;
-        for (int p = 0; p < nPred; ++p)
-        {
-            if (weightSum[static_cast<std::size_t>(p)] > 1.0e-8f)
-            {
-                dWindPreview[static_cast<std::size_t>(p)] /= weightSum[static_cast<std::size_t>(p)];
-                lastValid = dWindPreview[static_cast<std::size_t>(p)];
-                anyAssigned = true;
-            }
-            else
-            {
-                dWindPreview[static_cast<std::size_t>(p)] = lastValid;
-            }
-        }
-        usedLidarHistory = anyAssigned;
-        return dWindPreview;
-    }
-
-    inline float getLidarMeanWind(const LidarPreviewData& lidar, float fallbackWind)
-    {
-        if (!lidar.available || lidar.measuredSpeeds.empty()) return fallbackWind;
-
-        float sumWind = 0.0f;
-        for (float v : lidar.measuredSpeeds) sumWind += v;
-        return sumWind / static_cast<float>(lidar.measuredSpeeds.size());
-    }
-
     inline void appendDebugLog(const std::string& path, const std::string& line)
     {
         if (!gEnableTraceFiles) return;
@@ -1443,7 +1050,7 @@ namespace
     {
         if (path.empty()) return;
         resetDebugLog(path);
-        appendDebugLog(path, "# DISCON_MPC_CPP lidar debug log");
+        appendDebugLog(path, "# DISCON_MPC_CPP debug log");
         appendDebugLog(path, "# generated_at=" + makeTimestampString());
 
         std::ostringstream cfg;
@@ -1464,49 +1071,6 @@ namespace
               << ", runtime_generated=" << (gTerminal.ready ? 1 : 0)
               << ", fallback_points=" << gTerminal.fallbackPoints;
         appendDebugLog(path, sched.str());
-    }
-
-    inline void writePredictionLogHeader(const std::string& path)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnablePredictionTrace) return;
-        if (path.empty()) return;
-        resetDebugLog(path);
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << "time,horizon_step,pred_time,dOmega_pred,x_t_pred,v_t_pred,"
-               "dOmega_meas,x_t_meas,v_t_meas,wind_meas\n";
-    }
-
-    inline void appendPredictionLogRow(
-        const std::string& path,
-        float time,
-        int horizonStep,
-        float predTime,
-        float dOmegaPred,
-        float xPred,
-        float vPred,
-        float dOmegaMeas,
-        float xMeas,
-        float vMeas,
-        float windMeas)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnablePredictionTrace) return;
-        if (path.empty()) return;
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << std::fixed << std::setprecision(6)
-            << time << ','
-            << horizonStep << ','
-            << predTime << ','
-            << dOmegaPred << ','
-            << xPred << ','
-            << vPred << ','
-            << dOmegaMeas << ','
-            << xMeas << ','
-            << vMeas << ','
-            << windMeas << '\n';
     }
 
     inline void writeCommandTraceHeader(const std::string& path)
@@ -1651,191 +1215,6 @@ namespace
             << actualDt << '\n';
     }
 
-    inline void writeInputTraceHeader(const std::string& path)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnableInputTrace) return;
-        if (path.empty()) return;
-        resetDebugLog(path);
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << "time,iStatus,fracture_active,rotSpeed,horWindV,"
-               "avr_1019_towerVelFA,avr_1020_towerVelSS,avr_1021_towerDispFA,"
-               "avr_1023_J_RF,avr_1024_mass_imbalance,avr_1025_frac_r_R,avr_1026_sigma,avr_1027_status,"
-               "runtime_J_RF,runtime_J_EQ,"
-               "out_rotSpeed_rads,out_towerVelFA,out_towerDispFA\n";
-    }
-
-    inline void appendInputTraceRow(
-        const std::string& path,
-        float time,
-        int iStatus,
-        bool fractureActive,
-        float rotSpeed,
-        float horWindV,
-        float avrTowerVelFA,
-        float avrTowerVelSS,
-        float avrTowerDispFA,
-        float avrJRF,
-        float avrMassImbalance,
-        float avrFractureLocation,
-        float avrFractureSigma,
-        int avrFractureStatus,
-        float towerVelFA,
-        float towerDispFA)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnableInputTrace) return;
-        if (path.empty()) return;
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << std::fixed << std::setprecision(6)
-            << time << ','
-            << iStatus << ','
-            << (fractureActive ? 1 : 0) << ','
-            << rotSpeed << ','
-            << horWindV << ','
-            << avrTowerVelFA << ','
-            << avrTowerVelSS << ','
-            << avrTowerDispFA << ','
-            << avrJRF << ','
-            << avrMassImbalance << ','
-            << avrFractureLocation << ','
-            << avrFractureSigma << ','
-            << avrFractureStatus << ','
-            << gJRFRuntime << ','
-            << gJEQRuntime << ','
-            << rotSpeed << ','
-            << towerVelFA << ','
-            << towerDispFA << '\n';
-    }
-
-    inline void writeTuningTraceHeader(const std::string& path)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnableTuningTrace) return;
-        if (path.empty()) return;
-        resetDebugLog(path);
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        out << "time,fracture_active,qp_solved,fallback_used,fallback_count,terminal_idx,"
-               "rotSpeed_rpm,rotSpeed_rads,towerDispFA,towerVelFA,horWindV,dWind,"
-               "tg_ref,beta_ref,prevGenTorque,prevPitchCmd,demandedGenTorque,demandedPitch,"
-               "deltaTg_cmd,deltaBeta_cmd,"
-               "x0_dOmega,x1_xt,x2_vt,x3_tgerr,x4_betaerr,"
-               "J_total,J_omega,J_x,J_v,J_tg,J_beta,J_du_tg,J_du_beta,J_terminal,"
-               "Qomega_eff,Qx_eff,Qv_eff,QTg_eff,QBeta_eff,RT_eff,RB_eff,"
-               "pred_max_abs_dOmega,pred_max_abs_xt,pred_max_abs_vt,"
-               "trace_note\n";
-    }
-
-    inline void appendTuningTraceRow(
-        const std::string& path,
-        float time,
-        bool fractureActive,
-        bool qpSolved,
-        bool fallbackUsed,
-        int fallbackCount,
-        int terminalIdx,
-        float rotSpeedRpm,
-        float rotSpeedRads,
-        float towerDispFA,
-        float towerVelFA,
-        float horWindV,
-        float dWind,
-        float tgRefNow,
-        float betaRefNow,
-        float prevGenTorque,
-        float prevPitchCmd,
-        float demandedGenTorque,
-        float demandedPitch,
-        float deltaTgCmd,
-        float deltaBetaCmd,
-        const std::array<float, N_STATE>& xbar0,
-        float Jtotal,
-        float Jomega,
-        float Jx,
-        float Jv,
-        float Jtg,
-        float Jbeta,
-        float JduTg,
-        float JduBeta,
-        float Jterminal,
-        float qOmegaEff,
-        float qXEff,
-        float qVEff,
-        float qTgEff,
-        float qBetaEff,
-        float rTEff,
-        float rBEff,
-        float predMaxAbsDOmega,
-        float predMaxAbsXt,
-        float predMaxAbsVt,
-        const std::string& note)
-    {
-        if (!gEnableTraceFiles) return;
-        if (!gEnableTuningTrace) return;
-        if (path.empty()) return;
-        const bool fallbackTransition = (fallbackUsed != gState.lastTuningTraceFallbackState);
-        const bool noteIsSpecial = (note != "qp");
-        const bool periodicDue =
-            (gState.lastTuningTraceTime < 0.0f) ||
-            ((time - gState.lastTuningTraceTime) >= TUNING_TRACE_DT);
-        if (!(fallbackUsed || fallbackTransition || noteIsSpecial || periodicDue))
-            return;
-
-        std::ofstream out(path, std::ios::app);
-        if (!out) return;
-        gState.lastTuningTraceTime = time;
-        gState.lastTuningTraceFallbackState = fallbackUsed;
-        out << std::fixed << std::setprecision(6)
-            << time << ','
-            << (fractureActive ? 1 : 0) << ','
-            << (qpSolved ? 1 : 0) << ','
-            << (fallbackUsed ? 1 : 0) << ','
-            << fallbackCount << ','
-            << terminalIdx << ','
-            << rotSpeedRpm << ','
-            << rotSpeedRads << ','
-            << towerDispFA << ','
-            << towerVelFA << ','
-            << horWindV << ','
-            << dWind << ','
-            << tgRefNow << ','
-            << betaRefNow << ','
-            << prevGenTorque << ','
-            << prevPitchCmd << ','
-            << demandedGenTorque << ','
-            << demandedPitch << ','
-            << deltaTgCmd << ','
-            << deltaBetaCmd << ','
-            << xbar0[0] << ','
-            << xbar0[1] << ','
-            << xbar0[2] << ','
-            << xbar0[3] << ','
-            << xbar0[4] << ','
-            << Jtotal << ','
-            << Jomega << ','
-            << Jx << ','
-            << Jv << ','
-            << Jtg << ','
-            << Jbeta << ','
-            << JduTg << ','
-            << JduBeta << ','
-            << Jterminal << ','
-            << qOmegaEff << ','
-            << qXEff << ','
-            << qVEff << ','
-            << qTgEff << ','
-            << qBetaEff << ','
-            << rTEff << ','
-            << rBEff << ','
-            << predMaxAbsDOmega << ','
-            << predMaxAbsXt << ','
-            << predMaxAbsVt << ','
-            << note << '\n';
-    }
-
     inline float interp2d(
         const std::vector<float>& windPts,
         const std::vector<float>& speedPts,
@@ -1927,72 +1306,9 @@ namespace
         }
     }
 
-    inline float interp1dClamped(const std::vector<float>& xPts, const std::vector<float>& yPts, float x)
-    {
-        if (xPts.empty() || yPts.empty()) return 0.0f;
-        if (xPts.size() == 1 || yPts.size() == 1) return yPts.front();
-
-        x = clampToRange(x, xPts.front(), xPts.back());
-        int idx = 0;
-        while (idx + 1 < static_cast<int>(xPts.size()) && xPts[idx + 1] < x) ++idx;
-        const int idx2 = std::min(idx + 1, static_cast<int>(xPts.size()) - 1);
-        const float x1 = xPts[idx];
-        const float x2 = xPts[idx2];
-        const float y1 = yPts[idx];
-        const float y2 = yPts[idx2];
-        if (idx2 == idx || std::fabs(x2 - x1) < 1.0e-8f) return y1;
-        const float a = (x - x1) / (x2 - x1);
-        return (1.0f - a) * y1 + a * y2;
-    }
-
-    inline float evaluateReferenceCurveKnm(float rotSpeedRpm, float windNow)
-    {
-        if (!gRefCurve.loaded) return TG_REF * 1.0e-3f;
-
-        const float tgHi = interp1dClamped(gRefCurve.windPtsMs, gRefCurve.tgHiKnm, windNow);
-        const float omegaHi = interp1dClamped(gRefCurve.windPtsMs, gRefCurve.omegaHiRpm, windNow);
-        const float omegaLo = interp1dClamped(gRefCurve.windPtsMs, gRefCurve.omegaLoRpm, windNow);
-        const float shapeP = std::max(0.1f, interp1dClamped(gRefCurve.windPtsMs, gRefCurve.shapeP, windNow));
-
-        if (rotSpeedRpm >= omegaHi) return tgHi;
-        if (rotSpeedRpm <= omegaLo) return 0.0f;
-
-        const float xi = (rotSpeedRpm - omegaLo) / std::max(omegaHi - omegaLo, 1.0e-6f);
-        return tgHi * std::pow(clampToRange(xi, 0.0f, 1.0f), shapeP);
-    }
-
-    inline float getShutdownRefTime(float time)
-    {
-        return std::max(0.0f, time - gFractureTime);
-    }
-
-    inline float getRotorSpeedReference(float time)
-    {
-        if (!gShutdownRef.loaded) return OMEGA_REF;
-        const float tau = getShutdownRefTime(time);
-        return interp1dClamped(gShutdownRef.timeS, gShutdownRef.omegaRefRpm, tau) / RPS2RPM;
-    }
-
-    inline float getPitchReference(float time)
-    {
-        if (!gShutdownRef.loaded) return BETA_REF;
-        const float tau = getShutdownRefTime(time);
-        return interp1dClamped(gShutdownRef.timeS, gShutdownRef.betaRefDeg, tau) * D2R;
-    }
-
-    inline float getGeneratorTorqueReference(float time, float rotSpeed, float windNow)
-    {
-        if (gShutdownRef.loaded)
-        {
-            const float tau = getShutdownRefTime(time);
-            return interp1dClamped(gShutdownRef.timeS, gShutdownRef.tgRefKnm, tau) * 1000.0f;
-        }
-        // Current paper-aligned path uses the fixed generator-torque reference.
-        (void)time;
-        (void)rotSpeed;
-        (void)windNow;
-        return TG_REF;
-    }
+    inline float getRotorSpeedReference(float) { return OMEGA_REF; }
+    inline float getPitchReference(float) { return BETA_REF; }
+    inline float getGeneratorTorqueReference(float, float, float) { return TG_REF; }
 
     inline void initializeBaselineStates(float time, float genSpeed, float bladePitch1)
     {
@@ -2078,7 +1394,6 @@ namespace
         float horWindV,
         float towerDispFA,
         float towerVelFA,
-        const LidarPreviewData& lidar,
         float prevAppliedGenTorque,
         float prevAppliedPitch,
         float prevCommandGenTorque,
@@ -2112,8 +1427,6 @@ namespace
         const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, windRef);
         const float betaRefNow = getPitchReference(time);
         const float dWind = horWindV - windRef;
-        bool usedLidarHistory = false;
-        const std::vector<float> dWindPreview = buildWindPreviewDeltas(time, horWindV, nPred, dtPred, usedLidarHistory);
 
         const float gTOmegaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTomega, windRef, rotSpeedRPM) : G_TOMEGA_DEFAULT;
         const float gTBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GTbeta, windRef, rotSpeedRPM) : G_TBETA_DEFAULT;
@@ -2122,10 +1435,10 @@ namespace
         const float gFBetaNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFbeta, windRef, rotSpeedRPM) : G_FBETA_DEFAULT;
         const float gFUNow = gTable.loaded ? interp2d(gTable.windPtsMs, gTable.speedPtsRpm, gTable.GFu, windRef, rotSpeedRPM) : G_FU_DEFAULT;
 #ifdef MPC_ENABLE_TIMING
-        markTiming(2); // references, preview construction, and gain-table interpolation
+        markTiming(2); // references, wind deviation, and gain-table interpolation
 #endif
 
-        // Augmented state with first-order actuator memory:
+        // Augmented state with applied torque and pitch:
         // xbar = [ dOmega, x_t, v_t, Tg_applied - Tg_ref, beta_applied - beta_ref ]^T.
         // The QP decision variables are absolute command errors
         // [Tg_cmd - Tg_ref, beta_cmd - beta_ref], not command increments.
@@ -2157,8 +1470,8 @@ namespace
         const float b32 = dtPred * gFBetaNow / M_T;
         const float e11 = dtPred * gTUNow / gJEQRuntime;
         const float e31 = dtPred * gFUNow / M_T;
-        const float tgRetain = actuatorRetention(dtPred, gTorqueActuatorTau);
-        const float betaRetain = actuatorRetention(dtPred, gPitchActuatorTau);
+        const float tgRetain = 0.0f;
+        const float betaRetain = 0.0f;
         const float tgCmdGain = 1.0f - tgRetain;
         const float betaCmdGain = 1.0f - betaRetain;
 
@@ -2182,8 +1495,6 @@ namespace
 
         MatNN terminalP = getScheduledTerminalP(horWindV, rotSpeedRPM);
         for (float& value : terminalP) value *= gTerminalCostScale;
-        const MatUN terminalK = getScheduledTerminalK(horWindV, rotSpeedRPM);
-        (void)terminalK;
 
         // Build prediction matrices X = F*x0 + G*U
         const int NX = N_STATE * nPred;
@@ -2207,7 +1518,6 @@ namespace
             gSolverWs.ubA.assign(static_cast<std::size_t>(NC), BIG_POS);
             gSolverWs.xOpt.assign(static_cast<std::size_t>(NU), 0.0);
             gSolverWs.WG.assign(static_cast<std::size_t>(N_STATE * NU), 0.0f);
-            gSolverWs.powers.resize(static_cast<std::size_t>(nPred));
         }
         else
         {
@@ -2236,26 +1546,6 @@ namespace
         auto& ubA = gSolverWs.ubA;
         auto& xOpt = gSolverWs.xOpt;
         auto& WG = gSolverWs.WG;
-
-        auto matMulSq = [&](const std::array<float, N_STATE* N_STATE>& M,
-            const std::array<float, N_STATE* N_STATE>& N) {
-                std::array<float, N_STATE* N_STATE> R{};
-                for (int i = 0; i < N_STATE; ++i)
-                    for (int j = 0; j < N_STATE; ++j)
-                        for (int k = 0; k < N_STATE; ++k)
-                            R[i * N_STATE + j] += M[i * N_STATE + k] * N[k * N_STATE + j];
-                return R;
-            };
-
-        auto matMulAB = [&](const std::array<float, N_STATE* N_STATE>& M,
-            const std::array<float, N_STATE* N_CTRL>& N) {
-                std::array<float, N_STATE* N_CTRL> R{};
-                for (int i = 0; i < N_STATE; ++i)
-                    for (int j = 0; j < N_CTRL; ++j)
-                        for (int k = 0; k < N_STATE; ++k)
-                            R[i * N_CTRL + j] += M[i * N_STATE + k] * N[k * N_CTRL + j];
-                return R;
-            };
 
         std::vector<float> sensitivity(static_cast<std::size_t>(N_STATE * NU), 0.0f);
         std::vector<float> nextSensitivity(static_cast<std::size_t>(N_STATE * NU), 0.0f);
@@ -2288,28 +1578,17 @@ namespace
         }
 
         // c = predicted state stack under zero absolute command errors.
-        // If lidar preview is available, each prediction step uses the
-        // corresponding preview disturbance dWindPreview[p]. Otherwise, fall
-        // back to the legacy constant-over-horizon disturbance dWind.
+        // Hold the measured wind deviation constant over the prediction horizon.
         std::array<float, N_STATE> xpred = xbar0;
         for (int p = 0; p < nPred; ++p)
         {
-            const float dWindStep = gLidar.available ? dWindPreview[static_cast<std::size_t>(p)] : dWind;
+            const float dWindStep = dWind;
             std::array<float, N_STATE> xnext{};
             for (int i = 0; i < N_STATE; ++i)
             {
                 for (int j = 0; j < N_STATE; ++j)
                     xnext[i] += Abar[i * N_STATE + j] * xpred[j];
                 xnext[i] += Ebar[i] * dWindStep;
-            }
-
-            if (gShutdownRef.loaded)
-            {
-                const float tPrev = time + static_cast<float>(p) * dtPred;
-                const float tNext = time + static_cast<float>(p + 1) * dtPred;
-                xnext[0] -= (getRotorSpeedReference(tNext) - getRotorSpeedReference(tPrev));
-                xnext[3] -= (getGeneratorTorqueReference(tNext, rotSpeed, horWindV) - getGeneratorTorqueReference(tPrev, rotSpeed, horWindV));
-                xnext[4] -= (getPitchReference(tNext) - getPitchReference(tPrev));
             }
 
             for (int i = 0; i < N_STATE; ++i)
@@ -2434,9 +1713,7 @@ namespace
                 for (int j = 0; j < NU; ++j)
                     Acon[row * NU + j] = G[omegaStateIndex * NU + j];
 
-                const float omegaRefPred = gShutdownRef.loaded
-                    ? getRotorSpeedReference(time + static_cast<float>(p + 1) * dtPred)
-                    : OMEGA_REF;
+                const float omegaRefPred = OMEGA_REF;
                 lbA[row] = static_cast<real_t>(OMEGA_MIN - omegaRefPred - c[omegaStateIndex]);
                 ubA[row] = static_cast<real_t>(BIG_POS);
             }
@@ -2553,162 +1830,30 @@ namespace
         demandedPitchCmd = std::clamp(rawDemandedPitchCmd, prevCommandPitch - dBetaRateApply, prevCommandPitch + dBetaRateApply);
         demandedGenTorque = std::clamp(demandedGenTorque, VS_MIN_TQ, VS_MAX_TQ);
         demandedPitchCmd = std::clamp(demandedPitchCmd, PC_MIN_PIT, PC_MAX_PIT);
-        const float dTgApplied = demandedGenTorque - prevCommandGenTorque;
-        const float dBetaApplied = demandedPitchCmd - prevCommandPitch;
 #ifdef MPC_ENABLE_TIMING
         const auto uReadyTime = markTiming(8); // primal extraction and first command limiting
         gLastTimingUs[10] =
             std::chrono::duration<double, std::micro>(uReadyTime - timingStart).count();
 #endif
 
-        float Jomega = 0.0f;
-        float Jx = 0.0f;
-        float Jv = 0.0f;
-        float Jtg = 0.0f;
-        float Jbeta = 0.0f;
-        float JduTg = 0.0f;
-        float JduBeta = 0.0f;
-        float Jterminal = 0.0f;
-        float predMaxAbsDOmega = 0.0f;
-        float predMaxAbsXt = 0.0f;
-        float predMaxAbsVt = 0.0f;
-
-        for (int p = 0; p < nPred; ++p)
+        if (gEnableTraceFiles && !gState.hasOneStepPrediction)
         {
-            const int xBase = p * N_STATE;
-            float dOmegaPred = c[xBase + 0];
-            float xPred = c[xBase + 1];
-            float vPred = c[xBase + 2];
-            for (int j = 0; j < NU; ++j)
-            {
-                dOmegaPred += G[(xBase + 0) * NU + j] * static_cast<float>(xOpt[j]);
-                xPred += G[(xBase + 1) * NU + j] * static_cast<float>(xOpt[j]);
-                vPred += G[(xBase + 2) * NU + j] * static_cast<float>(xOpt[j]);
-            }
-
-            predMaxAbsDOmega = std::max(predMaxAbsDOmega, std::fabs(dOmegaPred));
-            predMaxAbsXt = std::max(predMaxAbsXt, std::fabs(xPred));
-            predMaxAbsVt = std::max(predMaxAbsVt, std::fabs(vPred));
-
-            if (p == 0 && !gState.hasOneStepPrediction)
-            {
-                gState.hasOneStepPrediction = true;
-                gState.oneStepPredictionIssuedTime = time;
-                gState.oneStepPredictionTime = time + dtPred;
-                gState.oneStepPredictionDt = dtPred;
-                gState.oneStepPredOmegaRef = getRotorSpeedReference(gState.oneStepPredictionTime);
-                gState.oneStepPredDOmega = dOmegaPred;
-                gState.oneStepPredTowerDispFA = xPred;
-                gState.oneStepPredTowerVelFA = vPred;
-            }
-
-            float tgErrPred = 0.0f;
-            float betaErrPred = 0.0f;
-            for (int j = 0; j < NU; ++j)
-            {
-                tgErrPred += G[(xBase + 3) * NU + j] * static_cast<float>(xOpt[j]);
-                betaErrPred += G[(xBase + 4) * NU + j] * static_cast<float>(xOpt[j]);
-            }
-            tgErrPred += c[xBase + 3];
-            betaErrPred += c[xBase + 4];
-
-            if (p == nPred - 1)
-            {
-                const std::array<float, N_STATE> xTerminal = {
-                    dOmegaPred, xPred, vPred, tgErrPred, betaErrPred
-                };
-                for (int r = 0; r < N_STATE; ++r)
-                    for (int s = 0; s < N_STATE; ++s)
-                        Jterminal += xTerminal[r] * terminalP[r * N_STATE + s] * xTerminal[s];
-            }
-            else
-            {
-                Jomega += gQOmega * dOmegaPred * dOmegaPred;
-                Jx += gQX * xPred * xPred;
-                Jv += gQV * vPred * vPred;
-                Jtg += gQTg * tgErrPred * tgErrPred;
-                Jbeta += gQBeta * betaErrPred * betaErrPred;
-            }
-
-            appendPredictionLogRow(
-                gPredictionLogPath,
-                time,
-                p + 1,
-                time + static_cast<float>(p + 1) * dtPred,
-                dOmegaPred,
-                xPred,
-                vPred,
-                x0,
-                x1,
-                x2,
-                horWindV
-            );
+            std::array<float, 3> prediction = { c[0], c[1], c[2] };
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < NU; ++j)
+                    prediction[i] += G[i * NU + j] * static_cast<float>(xOpt[j]);
+            gState.hasOneStepPrediction = true;
+            gState.oneStepPredictionIssuedTime = time;
+            gState.oneStepPredictionTime = time + dtPred;
+            gState.oneStepPredictionDt = dtPred;
+            gState.oneStepPredOmegaRef = OMEGA_REF;
+            gState.oneStepPredDOmega = prediction[0];
+            gState.oneStepPredTowerDispFA = prediction[1];
+            gState.oneStepPredTowerVelFA = prediction[2];
         }
-
-        for (int p = 0; p < nCtrlH; ++p)
-        {
-            const float tgCmdErr = static_cast<float>(xOpt[p * N_CTRL + 0]);
-            const float betaCmdErr = static_cast<float>(xOpt[p * N_CTRL + 1]);
-            const float prevTgCmdErr = (p == 0)
-                ? prevCommandTgErr
-                : static_cast<float>(xOpt[(p - 1) * N_CTRL + 0]);
-            const float prevBetaCmdErr = (p == 0)
-                ? prevCommandBetaErr
-                : static_cast<float>(xOpt[(p - 1) * N_CTRL + 1]);
-            const float duTg = tgCmdErr - prevTgCmdErr;
-            const float duBeta = betaCmdErr - prevBetaCmdErr;
-            JduTg += gRT * duTg * duTg;
-            JduBeta += gRB * duBeta * duBeta;
-        }
-
-        const float Jtotal = Jomega + Jx + Jv + Jtg + Jbeta + JduTg + JduBeta + Jterminal;
-        appendTuningTraceRow(
-            gTuningTracePath,
-            time,
-            gState.fractureActive,
-            true,
-            false,
-            gState.fallbackCount,
-            gCurrentTerminalIndex,
-            rotSpeedRPM,
-            rotSpeed,
-            towerDispFA,
-            towerVelFA,
-            horWindV,
-            dWind,
-            tgRefNow,
-            betaRefNow,
-            prevAppliedGenTorque,
-            prevAppliedPitch,
-            demandedGenTorque,
-            demandedPitchCmd,
-            dTgApplied,
-            dBetaApplied,
-            xbar0,
-            Jtotal,
-            Jomega,
-            Jx,
-            Jv,
-            Jtg,
-            Jbeta,
-            JduTg,
-            JduBeta,
-            Jterminal,
-            gQOmega,
-            gQX,
-            gQV,
-            gQTg,
-            gQBeta,
-            gRT,
-            gRB,
-            predMaxAbsDOmega,
-            predMaxAbsXt,
-            predMaxAbsVt,
-            "qp"
-        );
 
 #ifdef MPC_ENABLE_TIMING
-        const auto timingEnd = markTiming(9); // optional prediction/tuning diagnostics
+        const auto timingEnd = markTiming(9); // optional one-step prediction diagnostics
         gLastTimingUs[1] =
             std::chrono::duration<double, std::micro>(timingEnd.time_since_epoch()).count();
         gLastTimingUs[11] =
@@ -2745,12 +1890,8 @@ DLL_EXPORT int MPC_GET_LAST_SOLVE_INFO(int* values, int capacity)
     return 2;
 }
 
-// Minimal C++ DISCON shell.
-// This version is intentionally simple:
-// - reads the same avrSWAP layout as the Fortran DISCON
-// - keeps DLL linkage compatible with ServoDyn/Bladed interface
-// - provides a clean location to insert qpOASES-based MPC later
-DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, const char* avcOUTNAME, char* avcMSG)
+// Bladed interface for the modified OpenFAST fracture signal layout.
+static void runDISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, const char* avcOUTNAME, char* avcMSG)
 {
     if (avrSWAP == nullptr || aviFAIL == nullptr || avcMSG == nullptr)
         return;
@@ -2764,28 +1905,32 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     const int outNameLen = std::max(0, static_cast<int>(std::lround(avrSWAP[50])));// avrSWAP(51)
 
     const int iStatus = static_cast<int>(std::lround(avrSWAP[0]));  // avrSWAP(1)
+    if (iStatus < 0)
+    {
+#ifdef MPC_ENABLE_TIMING
+        flushTimingRows();
+#endif
+        gHotstartQp.reset();
+        gHotstartQpReady = false;
+        gState.initialized = false;
+        *aviFAIL = 0;
+        writeMessage(avcMSG, msgLen, "");
+        return;
+    }
     const float time = avrSWAP[1];                                  // avrSWAP(2)
     const float bladePitch1 = avrSWAP[3];                           // avrSWAP(4)
     const float genSpeed = avrSWAP[19];                             // avrSWAP(20)
     const float rotSpeed = avrSWAP[20];                             // avrSWAP(21)
     const float horWindV = avrSWAP[26];                             // avrSWAP(27)
     const float towerVelFA = avrSWAP[1018];                         // avrSWAP(1019)
-    const float towerVelSS = avrSWAP[1019];                         // avrSWAP(1020)
     const float towerDispFA = avrSWAP[1020];                        // avrSWAP(1021)
-    readLidarPreviewData(avrSWAP, gLidar);
 
-    (void)genSpeed;
-    (void)rotSpeed;
-    (void)horWindV;
-    (void)towerVelFA;
-    (void)towerVelSS;
-    (void)towerDispFA;
-    (void)cArrayToString(accINFILE, inFileLen);
-    (void)cArrayToString(avcOUTNAME, outNameLen);
 
     if (iStatus == 0 || !gState.initialized)
     {
-        gState.initialized = true;
+        gState = {};
+        gTable = {};
+        gTerminal = {};
         gState.fractureActive = false;
         gState.lastTime = time;
         gState.lastGenTorque = 0.0f;
@@ -2793,11 +1938,9 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gState.targetGenTorque = 0.0f;
         gState.targetPitchCmd = bladePitch1;
         gState.lastPitchRate = 0.0f;
-        gState.lastLidarLogTime = -1.0f;
+        gState.lastDebugLogTime = -1.0f;
         gState.fallbackCount = 0;
         gState.lastStepUsedFallback = false;
-        gState.lastTuningTraceTime = -1.0f;
-        gState.lastTuningTraceFallbackState = false;
         gState.lastCommandTraceTime = -1.0f;
         gState.mpcCommandInitialized = false;
         gState.lastMpcSolveTime = time;
@@ -2819,17 +1962,13 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         gFractureSigma = 1.0f;
         gFractureStatusFromFAST = 0;
         gFractureInertiaLocked = false;
-        gLidarHistory.clear();
         gHotstartQp.reset();
         gHotstartQpReady = false;
 
         std::string loadErr;
         const std::string inFile = cArrayToString(accINFILE, inFileLen);
         const std::string outRoot = cArrayToString(avcOUTNAME, outNameLen);
-        gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".lidar_debug.log");
-        gPredictionLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_prediction.csv");
-        gInputTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_input_trace.csv");
-        gTuningTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_tuning_trace.csv");
+        gDebugLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_debug.log");
         gCommandTracePath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_command_trace.csv");
 #ifdef MPC_ENABLE_TIMING
         gTimingLogPath = replaceExtension(outRoot.empty() ? "DISCON_MPC_CPP" : outRoot, ".mpc_u_timing.csv");
@@ -2840,28 +1979,25 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
         if (tablesLoaded)
             terminalBuilt = buildRuntimeTerminalSchedule(loadErr);
         writeDebugLogHeader(gDebugLogPath);
-        writePredictionLogHeader(gPredictionLogPath);
-        writeInputTraceHeader(gInputTracePath);
-        writeTuningTraceHeader(gTuningTracePath);
         writeCommandTraceHeader(gCommandTracePath);
 
         if (tablesLoaded && terminalBuilt)
+        {
             initializeBaselineStates(time, genSpeed, bladePitch1);
+            gState.initialized = true;
+        }
 
         *aviFAIL = (tablesLoaded && terminalBuilt) ? 1 : -1;
         if (tablesLoaded && terminalBuilt)
         {
             std::ostringstream oss;
-            oss << "Running C++ DISCON shell: baseline control before fracture, MPC after fracture"
+            oss << "Running DISCON_MPC_CPP: baseline before fracture, MPC after fracture"
                 << " (N_PRED=" << gNPred << ", N_CTRL_H=" << gNCtrlH
                 << ", MPC_DT=" << gPredictionDt
                 << ", CTRL_DT=" << gControlDt
-                << ", QP_HOTSTART=" << (gEnableQpHotstart ? 1 : 0)
+                << ", QP_START=" << (gEnableQpHotstart ? "warm" : "cold")
                 << ", nWSR=" << gNWSR
                 << ", terminalScale=" << gTerminalCostScale
-                << ", actuatorOrder=" << gActuatorOrder
-                << ", pitchTau=" << gPitchActuatorTau
-                << ", torqueTau=" << gTorqueActuatorTau
 #ifdef MPC_ENABLE_TIMING
                 << ", timingCsv=" << (timingLogReady ? "overwritten" : "disabled-file-busy")
 #endif
@@ -2869,7 +2005,10 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             writeMessage(avcMSG, msgLen, oss.str());
         }
         else
+        {
             writeMessage(avcMSG, msgLen, loadErr);
+            return;
+        }
     }
     else
     {
@@ -2896,21 +2035,16 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 
     const float dt = std::max(time - gState.lastTime, 1.0e-4f);
     updateOperatingWindReference(horWindV, dt);
-    updateLidarHistory(time, horWindV, gLidar);
 
     if (!gState.fractureActive && time >= gFractureTime)
     {
         gState.fractureActive = true;
     }
 
-    const float prevGenTorqueForTrace = gState.lastGenTorque;
-    const float prevPitchCmdForTrace = gState.pitchCmd;
     const float prevAppliedGenTorqueForActuator = gState.lastGenTorque;
     const float prevAppliedPitchForActuator = gState.pitchCmd;
-    const float prevTargetGenTorqueForControl =
-        (gActuatorOrder == 1) ? gState.targetGenTorque : gState.lastGenTorque;
-    const float prevTargetPitchForControl =
-        (gActuatorOrder == 1) ? gState.targetPitchCmd : gState.pitchCmd;
+    const float prevTargetGenTorqueForControl = gState.lastGenTorque;
+    const float prevTargetPitchForControl = gState.pitchCmd;
     const bool hasPredForTrace =
         gState.hasOneStepPrediction &&
         (time + 1.0e-6f >= gState.oneStepPredictionTime);
@@ -2930,25 +2064,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     if (hasPredForTrace)
         gState.hasOneStepPrediction = false;
 
-    appendInputTraceRow(
-        gInputTracePath,
-        time,
-        iStatus,
-        gState.fractureActive,
-        rotSpeed,
-        horWindV,
-        avrSWAP[1018],
-        avrSWAP[1019],
-        avrSWAP[1020],
-        avrSWAP[FRACTURE_J_RF_IDX],
-        avrSWAP[FRACTURE_MASS_IMBALANCE_IDX],
-        avrSWAP[FRACTURE_LOCATION_IDX],
-        avrSWAP[FRACTURE_SIGMA_IDX],
-        gFractureStatusFromFAST,
-        towerVelFA,
-        towerDispFA
-    );
-
     float demandedGenTorque = 0.0f;
     float demandedPitch = bladePitch1;
     bool qpSolvedForTrace = false;
@@ -2956,14 +2071,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
 
     if (!gState.fractureActive)
     {
-        const float savedAppliedGenTorque = gState.lastGenTorque;
-        const float savedAppliedPitchCmd = gState.pitchCmd;
-        if (gActuatorOrder == 1)
-        {
-            gState.lastGenTorque = prevTargetGenTorqueForControl;
-            gState.pitchCmd = prevTargetPitchForControl;
-        }
-
         runBaselineDISCON(
             iStatus,
             time,
@@ -2974,13 +2081,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
             demandedPitch
         );
 
-        if (gActuatorOrder == 1)
-        {
-            gState.targetGenTorque = demandedGenTorque;
-            gState.targetPitchCmd = demandedPitch;
-            gState.lastGenTorque = savedAppliedGenTorque;
-            gState.pitchCmd = savedAppliedPitchCmd;
-        }
     }
     else
     {
@@ -3011,7 +2111,6 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 horWindV,
                 towerDispFA,
                 towerVelFA,
-                gLidar,
                 prevAppliedGenTorqueForActuator,
                 prevAppliedPitchForActuator,
                 prevTargetGenTorqueForControl,
@@ -3044,57 +2143,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 fallbackUsedForTrace = true;
                 gState.fallbackCount += 1;
                 *aviFAIL = 1;
-                writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; fallback K used." : (qpErr + " | fallback K used"));
+                writeMessage(avcMSG, msgLen, qpErr.empty() ? "qpOASES failed; scheduled shutdown fallback used." : (qpErr + " | scheduled shutdown fallback used"));
 
-                const float tgRefNow = getGeneratorTorqueReference(time, rotSpeed, gState.operatingWindRef);
-                const float betaRefNow = getPitchReference(time);
-                const std::array<float, N_STATE> z = buildAugmentedState(
-                    time, rotSpeed, gState.operatingWindRef, towerDispFA, towerVelFA, prevAppliedGenTorqueForActuator, prevAppliedPitchForActuator
-                );
-                appendTuningTraceRow(
-                    gTuningTracePath,
-                    time,
-                    gState.fractureActive,
-                    false,
-                    true,
-                    gState.fallbackCount,
-                    gCurrentTerminalIndex,
-                    rotSpeed * RPS2RPM,
-                    rotSpeed,
-                    towerDispFA,
-                    towerVelFA,
-                    horWindV,
-                    0.0f,
-                    tgRefNow,
-                    betaRefNow,
-                    prevAppliedGenTorqueForActuator,
-                    prevAppliedPitchForActuator,
-                    demandedGenTorque,
-                    demandedPitch,
-                    demandedGenTorque - prevTargetGenTorqueForControl,
-                    demandedPitch - prevTargetPitchForControl,
-                    z,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    gQOmega,
-                    gQX,
-                    gQV,
-                    gQTg,
-                    gQBeta,
-                    gRT,
-                    gRB,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    "fallback"
-                );
             }
             else
             {
@@ -3109,13 +2159,8 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     const float demandedPitchRate = std::clamp((demandedPitch - prevTargetPitchForControl) / dt, -PC_MAX_RAT, PC_MAX_RAT);
     const float rawActuatorDt = time - gState.lastTime;
     const float actuatorDt = (iStatus == 0 || rawActuatorDt <= 0.0f) ? 0.0f : rawActuatorDt;
-    const bool actuatorLagActive = (gActuatorOrder == 1 && iStatus != 0);
-    const float requestedAppliedGenTorque = actuatorLagActive
-        ? applyFirstOrderActuator(prevAppliedGenTorqueForActuator, demandedGenTorque, actuatorDt, gTorqueActuatorTau)
-        : demandedGenTorque;
-    const float requestedAppliedPitch = actuatorLagActive
-        ? applyFirstOrderActuator(prevAppliedPitchForActuator, demandedPitch, actuatorDt, gPitchActuatorTau)
-        : demandedPitch;
+    const float requestedAppliedGenTorque = demandedGenTorque;
+    const float requestedAppliedPitch = demandedPitch;
     const float appliedGenTorque = std::clamp(
         (iStatus == 0)
             ? requestedAppliedGenTorque
@@ -3203,28 +2248,15 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
     gState.targetPitchCmd = demandedPitch;
     gState.lastPitchRate = appliedPitchRate;
 
-#ifdef MPC_ENABLE_TIMING
-    if (iStatus < 0) flushTimingRows();
-#endif
-
-    if (gState.fractureActive)
+    if (gState.fractureActive && gEnableTraceFiles)
     {
-        const float lidarMeanWind = getLidarMeanWind(gLidar, horWindV);
-        const float lidarPreviewDelta = lidarMeanWind - horWindV;
-        const bool usingLidarPreview = !gLidarHistory.empty();
-
-        if (gState.lastLidarLogTime < 0.0f || (time - gState.lastLidarLogTime) >= LIDAR_LOG_DT)
+        if (gState.lastDebugLogTime < 0.0f || (time - gState.lastDebugLogTime) >= DEBUG_LOG_DT)
         {
             std::ostringstream dbg;
             dbg << "time=" << time
                 << ", wind=" << horWindV
                 << ", windRef=" << gState.operatingWindRef
                 << ", rotSpeedRpm=" << rotSpeed * RPS2RPM
-                << ", lidarAvail=" << (gLidar.available ? 1 : 0)
-                << ", lidarPts=" << gLidar.measuredSpeeds.size()
-                << ", lidarMean=" << lidarMeanWind
-                << ", lidarDelta=" << lidarPreviewDelta
-                << ", previewSource=" << (usingLidarPreview ? "lidar-history" : "fallback-constant")
                 << ", terminalIdx=" << gCurrentTerminalIndex
                 << ", fallbackUsed=" << (gState.lastStepUsedFallback ? 1 : 0)
                 << ", fallbackCount=" << gState.fallbackCount
@@ -3237,7 +2269,24 @@ DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE, cons
                 << ", Tg=" << demandedGenTorque
                 << ", betaDeg=" << demandedPitch * R2D;
             appendDebugLog(gDebugLogPath, dbg.str());
-            gState.lastLidarLogTime = time;
+            gState.lastDebugLogTime = time;
         }
+    }
+}
+
+DLL_EXPORT void DISCON(float* avrSWAP, int* aviFAIL, const char* accINFILE,
+    const char* avcOUTNAME, char* avcMSG)
+{
+    try
+    {
+        runDISCON(avrSWAP, aviFAIL, accINFILE, avcOUTNAME, avcMSG);
+    }
+    catch (const std::exception& exception)
+    {
+        gState.initialized = false;
+        if (aviFAIL) *aviFAIL = -1;
+        if (avrSWAP && avcMSG)
+            writeMessage(avcMSG, std::max(1, static_cast<int>(avrSWAP[48])),
+                std::string("DISCON_MPC_CPP failed: ") + exception.what());
     }
 }

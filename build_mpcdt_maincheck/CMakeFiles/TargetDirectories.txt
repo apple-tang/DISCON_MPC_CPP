@@ -1,3 +1,0 @@
-D:/zju_soft_study/openfast5.0.0/openfast-main/vs-build/controllers/DISCON_MPC_CPP/build_mpcdt_maincheck/CMakeFiles/DISCON_MPC_CPP.dir
-D:/zju_soft_study/openfast5.0.0/openfast-main/vs-build/controllers/DISCON_MPC_CPP/build_mpcdt_maincheck/CMakeFiles/ALL_BUILD.dir
-D:/zju_soft_study/openfast5.0.0/openfast-main/vs-build/controllers/DISCON_MPC_CPP/build_mpcdt_maincheck/CMakeFiles/ZERO_CHECK.dir

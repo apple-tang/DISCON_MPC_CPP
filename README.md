@@ -1,160 +1,142 @@
 # DISCON_MPC_CPP
 
-Minimal C++ DLL shell for OpenFAST ServoDyn / Bladed-style `DISCON` control.
+Model predictive emergency shutdown control following partial-span wind-turbine blade breakage. The controller coordinates generator torque and collective pitch using a constrained quadratic program solved by qpOASES, through ServoDyn's Bladed-style `DISCON` interface.
 
-## Purpose
+**Author:** Daozhi Tang, Zhejiang University
 
-This directory provides a starting point for migrating the current
-Fortran fracture controller toward a C++ implementation that can call
-`qpOASES` for online MPC.
+**Contact:** [daozhitang@zju.edu.cn](mailto:daozhitang@zju.edu.cn)
 
-## Current behavior
+**Research:** *An Emergency Shutdown Framework for Wind Turbines Following Blade Breakage*
 
-- exports a `DISCON` symbol compatible with the current Bladed DLL interface
-- reads the main `avrSWAP` inputs already used by the Fortran controller
-- reads the following real-time signals from `avrSWAP`:
-  - rotor speed
-  - horizontal hub-height wind speed
-  - tower-top fore-aft velocity
-  - tower-top fore-aft displacement
-- treats the current wind-speed deviation as a constant preview disturbance over the prediction horizon
-- solves a minimal multi-step MPC/QP with `qpOASES`
-- writes back generator torque, collective pitch, and collective pitch rate
+The contribution is the blade-breakage shutdown scenario and the application of MPC to coordinated deceleration and tower-vibration mitigation. This repository contains the controller, not the modified OpenFAST plant, a fracture detector, or a learned world model. World-model integration is a future research direction.
 
-This means it is now a **minimal working MPC prototype**, but it still uses
-placeholder identified sensitivities and a short fixed prediction horizon.
+## Control behavior
+
+1. Before `FRACTURE_TIME`, run the NREL 5-MW baseline torque and collective-pitch logic.
+2. After the time trigger, latch MPC operation. Wind speed and rotor speed schedule local aerodynamic derivatives. Hold the current wind deviation over the prediction horizon.
+3. Optimize absolute torque/pitch commands, penalizing state deviations and successive command changes. Apply the first command and hold the target between solves.
+4. Enforce magnitude and command-rate constraints, plus a predicted rotor-speed lower bound. Independently rate-limit applied outputs at every positive-time OpenFAST callback.
+5. If warm start fails, retry with a fresh QP. If the solve still fails, use the scheduled shutdown fallback and report a warning. The same final actuator limits apply.
+
+The five-state model contains rotor-speed deviation, tower-top fore-aft displacement and velocity, and applied torque/pitch deviations. The current tuning preserves the previous default: terminal cost disabled (`gTerminalCostScale = 0`), with a scheduled LQR gain for fallback. The final prediction block has zero state weight. There is no implemented terminal invariant-set constraint or general stability guarantee. Near standstill, the rotor-speed constraint is relaxed using the existing wind-band thresholds and a 0.2 rpm floor.
+
+The Riccati calculation retains its 500-iteration budget. A nonconverged grid point receives zero feedback gain, so fallback at that point is rate-limited torque release and feathering. The startup message reports `terminalFallbackPts`; the supplied tuning currently reaches this fallback at all 667 grid points. The controller must therefore not be described as having a verified stabilizing LQR backup under this tuning.
+
+| Actuator | Magnitude | Maximum rate |
+| --- | --- | --- |
+| Generator torque | 0 to 47,402.91 N m | 15,000 N m/s |
+| Collective pitch | 0 to 90 degrees | 8 degrees/s |
+
+The actuator response is hard rate-limited. The unused optional first-order lag has been removed. Repeated calls at the same time do not advance applied outputs. Prediction step `MPC_DT` and solve interval `CTRL_DT` are independent of the elapsed physical time used for final output rate limiting.
+
+## OpenFAST interface
+
+Use the matching **modified OpenFAST build**. Standard OpenFAST does not provide this project's custom tower/fracture records. The caller must allocate and populate `avrSWAP` through record 1027. Numbers below are one-based; C++ indices are one less.
+
+| Record | Input | Unit |
+| --- | --- | --- |
+| 1, 2 | Controller status, simulation time | -, s |
+| 4 | Blade 1 pitch | rad |
+| 20, 21 | Generator speed, rotor speed | rad/s |
+| 27 | Horizontal hub-height wind speed | m/s |
+| 1019, 1021 | Tower-top fore-aft velocity, displacement | m/s, m |
+| 1023 | Post-fracture rotor inertia | kg m2 |
+| 1024 | Blade mass-imbalance first moment | kg m |
+| 1025, 1026 | Normalized fracture location, residual property ratio | - |
+| 1027 | Fracture status: 0 inactive, 1 transitioning, 2 finalized | - |
+
+The controller locks a valid finalized fracture inertia and rebuilds the fallback schedule. Until then, it uses rotor inertia 2.56488355e7 kg m2 plus generator inertia referred through the 97:1 gearbox. `FRACTURE_TIME` switches control; the plant's structural fracture must be configured separately at the matching time.
+
+Outputs include torque at record 47, pitch at records 42-45, pitch rate at record 46, and contactor/override flags. Only one turbine instance per loaded DLL is supported because controller state is process-global.
+
+## Build
+
+Requirements: C++17, CMake 3.18+, and a matching-architecture qpOASES library. On Windows, use an x64 Native Tools Command Prompt for Visual Studio. Match the compiler runtime to the qpOASES build.
+
+```powershell
+cmake -S . -B build -A x64 `
+  -DQPOASES_INCLUDE_DIR=C:/Dev/qpOASES/include `
+  -DQPOASES_LIBRARY=C:/Dev/qpOASES-build/libs/Release/qpOASES.lib
+cmake --build build --config Release
+```
+
+Output: `build/Release/DISCON.dll`. Override the two dependency paths or set `QPOASES_ROOT` for another installation. Set ServoDyn's `DLL_FileName` to the compiled DLL, `DLL_InFile` to `DISCON_MPC_CPP.IN`, and `DLL_ProcName` to `DISCON`. Use the DLL torque and pitch control modes in the existing turbine deck.
+
+## Configuration
+
+The single IN file uses `KEY = VALUE`, in any order. `#` and `!` begin comments. All 13 keys are required. Unknown/duplicate keys, invalid numbers, unsorted grids and incorrectly sized tables fail initialization. **Old positional IN files are unsupported: replace the IN file together with the new DLL.**
+
+| Key | Supplied value | Meaning |
+| --- | --- | --- |
+| `FRACTURE_TIME` | `30.0` | Controller switch time, s |
+| `MPC_DT`, `CTRL_DT` | `0.010`, `0.010` | Prediction step and solve interval, s |
+| `N_PRED`, `N_CTRL` | `330`, `70` | Prediction steps and independent command blocks |
+| `Q` | `30,200,200,1e-6,400` | State weights in the five-state order above |
+| `R` | `5,60` | Torque- and pitch-command change weights |
+| `NWSR` | `500` | qpOASES iteration budget per attempt |
+| `QP_START` | `cold` | `cold` or `warm` |
+| `DEBUG` | `0` | `1` enables debug and command traces |
+| `TABLE_DIR` | `.` | CSV directory relative to the IN file |
+| `SPEED_POINTS_RPM` | 1 to 12, step 0.5 | Ascending rotor-speed grid |
+| `WIND_POINTS_MS` | 2 to 30, step 1 | Ascending wind-speed grid |
+
+The supplied prediction horizon is 3.3 s; the independent control horizon is 0.7 s. These values preserve the local controller configuration, not necessarily every setting used in the paper's reported experiments.
+
+### Cold start, warm start and debug
+
+Edit these two keys in the same IN file:
+
+| Run | `QP_START` | `DEBUG` |
+| --- | --- | --- |
+| Cold start on every solve | `cold` | `0` |
+| Warm start after the first cold solve | `warm` | `0` |
+| Debug either solver mode | `cold` or `warm` | `1` |
+
+Cold start constructs a new `QProblem`. Warm start uses `SQProblem` to update changing matrices and reuse the previous working set. Debug is independent of solver initialization.
+
+Debug writes `<output-root>.mpc_debug.log` and `<output-root>.mpc_command_trace.csv`. The command trace distinguishes demanded targets from applied outputs and records states, fallback flags and one-step prediction diagnostics. It can support actuator inspection and future model-learning data preparation.
+
+## Gain tables
+
+The six headerless CSV files have 29 wind rows and 23 speed columns, ordered by the IN-file grids. They are loaded once at initialization and interpolated with boundary clamping.
+
+| File | Derivative | Unit |
+| --- | --- | --- |
+| `GTomega.csv` | Aerodynamic torque / rotor speed | N m / (rad/s) |
+| `GTbeta.csv` | Aerodynamic torque / collective pitch | N m / rad |
+| `GTu.csv` | Aerodynamic torque / wind speed | N m / (m/s) |
+| `GFomega.csv` | Rotor thrust / rotor speed | N / (rad/s) |
+| `GFbeta.csv` | Rotor thrust / collective pitch | N / rad |
+| `GFu.csv` | Rotor thrust / wind speed | N / (m/s) |
+
+The filename suffix `u` denotes wind speed. These are local OpenFAST C/D Jacobian sensitivities, not stable DC gains from `-C A^-1 B + D`. The active tables were repaired on 2026-09-15, including the regenerated 21 m/s row. Cleanup preserves the six active CSV files byte for byte; grid provenance is retained under `docs/`.
+
+## Timing and tests
+
+Optional timing instrumentation is independent of `DEBUG`:
+
+```powershell
+cmake -S . -B build -DMPC_ENABLE_TIMING=ON -DMPC_BUILD_TESTS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+python tools/benchmark_u_timing.py --dll build/Release/DISCON.dll --samples 100
+python tools/analyze_u_timing.py benchmark_u_timing_samples.csv --control-period-us 10000
+```
+
+The instrumented controller writes `<output-root>.mpc_u_timing.csv` and exports `MPC_GET_LAST_TIMING` / `MPC_GET_LAST_SOLVE_INFO`. Solve modes are 0 (cold), 1 (warm), and 2 (warm failed, cold retry used). Buffered rows flush on the final callback. A DLL-only benchmark uses synthetic inputs and does not establish aeroelastic stability or shutdown performance.
+
+Tests cover configuration validation, cold/warm solves, fallback, callback timing and actuator limits. Full OpenFAST closed-loop runs remain necessary after rebuilding.
 
 ## Files
 
-- `DISCON_MPC_CPP.cpp`
-  - minimal DLL entry and short-horizon MPC prototype logic
-- `CMakeLists.txt`
-  - standalone build file for the C++ DLL
-
-## Next steps to turn this into MPC
-
-1. Replace placeholder physical parameters with identified values
-2. Replace constant-over-horizon wind preview with a richer preview source if desired
-3. Refine identified physical parameters and weights
-4. Add richer state/output constraints if desired
-5. Externalize tuning parameters to an input file
-
-## Externalized MPC tuning parameters
-
-The current `.IN` file now externalizes:
-
-- `FractureTime`
-- `N_PRED`
-- `N_CTRL_H`
-- `MPC_DT`
-- `CTRL_DT`
-- `QP_HOTSTART`
-- `Q_OMEGA`
-- `Q_X`
-- `Q_V`
-- `Q_TG`
-- `Q_BETA`
-- `R_T`
-- `R_B`
-- `OMEGA_ERR_MAX`
-- `TOWER_DISP_MAX`
-- `TOWER_VEL_MAX`
-- `nWSR`
-
-`MPC_DT` is the internal prediction-model discretization step used by the MPC horizon. It does not
-need to match the incoming OpenFAST call interval. The applied generator-torque and pitch moves are
-still re-limited against the physical actuator-rate bounds using the actual controller call interval
-before they are written back to `avrSWAP`, so increasing `MPC_DT` for prediction does not remove
-the final output protection against torque/pitch overshoot.
-
-`CTRL_DT` is the online solve interval. With a 1 ms OpenFAST step and `CTRL_DT=0.010`, the MPC solves
-on the first post-fracture call and every 10 ms thereafter. The previous torque/pitch target is held
-on the nine intermediate calls, while any enabled first-order actuator dynamics still update every
-1 ms. The supplied configuration uses `MPC_DT=CTRL_DT=0.010 s`.
-
-The held MPC target is not written directly to OpenFAST. At every positive-time controller call, the
-applied generator torque and collective pitch move toward that target subject to the hard physical
-rates `VS_MAX_TQ_RATE` and `PC_MAX_RAT`. With a 1 ms OpenFAST step these limits are 15 N-m and
-0.008 degrees per step. Repeated calls at the same simulation time do not advance actuator state.
-
-`QP_HOTSTART=0` constructs and initializes a new `QProblem` on every solve. `QP_HOTSTART=1` uses an
-`SQProblem`: the first solve is cold, later solves update the changing matrices and reuse the previous
-working set. A failed hotstart is retried once from a cold start. Timing CSV rows identify mode 0
-(cold), 1 (hot), or 2 (hotstart failed and cold retry used), together with the consumed `nWSR` count.
-
-`nWSR` is the qpOASES working-set iteration budget used for each online QP solve. Increase it when
-larger `N_CTRL_H` or added state constraints begin to hit `RET_MAX_NWSR_REACHED`, at the cost of
-more online solver work per controller step.
-
-## Measuring U-computation time
-
-Timing instrumentation is compile-time optional, so the ordinary DLL has no timing calls. Configure
-with `-DMPC_ENABLE_TIMING=ON` to enable it. The instrumented DLL writes
-`<OpenFAST-output-root>.mpc_u_timing.csv`; gain tables are still read from the six CSV files only once
-during controller initialization.
-
-Each successful MPC solve records monotonic start/end timestamps and these durations in microseconds:
-
-- preprocessing and gain-table interpolation
-- local-model construction and workspace reset
-- condensed prediction matrices `G` and `c`
-- QP Hessian and gradient
-- input/rate/state constraints
-- qpOASES solve
-- primal-solution extraction and first-command limiting
-- post-solve diagnostics
-- total time until `U` is ready and total function time
-
-Rows are buffered and written in batches of 256, then flushed on the final OpenFAST controller call.
-This keeps disk I/O outside the measured `total_to_u_us` interval. Use `benchmark_u_timing.py` for a
-repeatable DLL-only benchmark and `analyze_u_timing.py` to produce percentile summaries and a plot.
-At controller initialization, an existing timing CSV with the same output root is deleted and recreated.
-If another application has locked that file, timing output is disabled for the run instead of appending
-new rows to stale data; the controller startup message reports `timingCsv=disabled-file-busy`.
-
-```powershell
-python benchmark_u_timing.py --dll timing_release\DISCON_timing.dll --dt 0.001 --samples 100 --warmup 20
-python analyze_u_timing.py benchmark_u_timing_samples.csv --control-period-us 10000
+```text
+DISCON_MPC_CPP.cpp       Controller and DISCON entry point
+DISCON_MPC_CPP.IN        Single named configuration
+CMakeLists.txt          DLL and optional tests
+GT*.csv, GF*.csv         Active SI-unit gain tables
+docs/                   Gain-table provenance
+tests/                  Controller regression checks
+tools/                  Timing benchmark and analysis
 ```
 
-## Rebuilding 5 MW aerodynamic gain tables
-
-The legacy six tables were built from 667 separate files covering 29 wind speeds and 23 rotor speeds;
-they were not copied from one 24 m/s case. However, the legacy builder used full-model DC gains and
-mixed kN/rpm table units with the SI units required by the controller equations.
-
-The replacement workflow uses local OpenFAST C/D Jacobian entries for the three controller-model
-coordinates `Omega [rad/s]`, collective pitch `[rad]`, and wind speed `[m/s]`. It never evaluates
-`-C A^-1 B + D`, and it refuses to create a rectangular table when a requested point is missing.
-
-```powershell
-# 1. Select post-fracture rotor-speed crossings from one time-domain output per wind speed.
-python find_5mw_rotspeed_times.py --cases-root <time-domain-root> --require-complete
-
-# 2. Create isolated Linearize=True cases and a traceable manifest.
-python generate_5mw_linearization_cases.py --schedule 5mw_linearization_schedule.csv `
-  --source-baseline <5MW_Baseline> --output-root openfast_5mw_linearization_cases
-
-# 3. After manually running those cases, extract the six SI-unit tables.
-python extract_5mw_mpc_gain_tables.py --lin-root openfast_5mw_linearization_cases `
-  --manifest openfast_5mw_linearization_cases\linearization_manifest.csv `
-  --config-template DISCON_MPC_CPP.IN --output-dir generated_5mw_gain_tables
-```
-
-For the requested 12, 14, 16, 18, 20, 22, and 24 m/s comparison, a pre-extracted candidate set is
-in `generated_5mw_gain_tables_12to24_even`. Its matching `DISCON_MPC_CPP.IN` points to the tables in
-that directory. Keep the legacy and local-Jacobian results separate until closed-loop validation is
-complete.
-
-The main six CSV files were updated on 2026-09-15 from the complete 29-by-23 local-Jacobian grid.
-The incorrectly labelled legacy 21 m/s row was regenerated from a fresh time-domain trajectory and
-23 new OpenFAST linearizations before extraction. The replaced DC-gain tables and their matching
-configuration are preserved in `legacy_gain_tables_before_si_repair_20260915`.
-
-## Example build (Visual Studio toolchain)
-
-```powershell
-cmd /c '\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" && ^
-\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe\" -S . -B build -A x64 && ^
-\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe\" --build build --config Release'
-```
+Historical controller copies, build trees, archived tables, linearization decks and old timing outputs are excluded from the maintained source tree. They are not runtime dependencies.

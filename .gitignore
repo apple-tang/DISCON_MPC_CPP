@@ -1,4 +1,13 @@
 build/
+build*/
+timing_release/
+.verification/
+__pycache__/
+*.mpc_*.csv
+*.mpc_debug.log
+benchmark_u_timing*.csv
+u_timing*.csv
+u_timing*.png
 *.obj
 *.lib
 *.exp
